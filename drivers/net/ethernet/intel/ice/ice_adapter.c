@@ -49,6 +49,7 @@ static int ice_adapter_init(void *priv, void *init_param)
 	for (int i = 0; i < ARRAY_SIZE(adapter->cpi_phy_lock); i++)
 		mutex_init(&adapter->cpi_phy_lock[i]);
 	mutex_init(&adapter->cgu_synce_lock);
+	mutex_init(&adapter->rebuild_lock);
 
 	spin_lock_init(&adapter->ports.lock);
 	INIT_LIST_HEAD(&adapter->ports.list);
@@ -66,6 +67,7 @@ static void ice_adapter_fini(void *priv)
 	for (int i = 0; i < ARRAY_SIZE(adapter->cpi_phy_lock); i++)
 		mutex_destroy(&adapter->cpi_phy_lock[i]);
 	mutex_destroy(&adapter->cgu_synce_lock);
+	mutex_destroy(&adapter->rebuild_lock);
 
 	cleanup_srcu_struct(&adapter->ports.srcu);
 	mutex_destroy(&adapter->ps_lock);
