@@ -56,6 +56,9 @@
 /* Timesync registers */
 #define PF_GLTSYN_CMD_SYNC_EXEC_CMD_M	GENMASK(1, 0)
 #define PF_GLTSYN_CMD_SYNC_SHTIME_EN_M	BIT(2)
+#define PF_GLTSYN_CMD_INIT_TIME_M	BIT(0)
+#define PF_GLTSYN_CMD_INIT_INCVAL_M	BIT(1)
+#define PF_GLTSYN_CMD_ADJ_TIME_M	BIT(2)
 
 /* Interrupts */
 #define PF_GLINT_BASE			0x08900000

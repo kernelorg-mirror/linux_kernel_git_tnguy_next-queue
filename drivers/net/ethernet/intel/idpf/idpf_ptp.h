@@ -7,13 +7,19 @@
 #include <linux/ptp_clock_kernel.h>
 
 /**
- * struct idpf_ptp_cmd - PTP command masks
- * @exec_cmd_mask: mask to trigger command execution
- * @shtime_enable_mask: mask to enable shadow time
+ * struct idpf_ptp_cmd_mask - PTP command masks
+ * @exec_cmd: mask to trigger command execution
+ * @shtime_enable: mask to enable shadow time
+ * @init_time: initialize the device clock timer
+ * @init_incval: initialize increment value
+ * @adj_time: adjust the device clock timer
  */
-struct idpf_ptp_cmd {
-	u32 exec_cmd_mask;
-	u32 shtime_enable_mask;
+struct idpf_ptp_cmd_mask {
+	u32 exec_cmd;
+	u32 shtime_enable;
+	u32 init_time;
+	u32 init_incval;
+	u32 adj_time;
 };
 
 /* struct idpf_ptp_dev_clk_regs - PTP device registers
@@ -183,7 +189,7 @@ struct idpf_ptp {
 	struct idpf_adapter *adapter;
 	u64 base_incval;
 	u64 max_adj;
-	struct idpf_ptp_cmd cmd;
+	struct idpf_ptp_cmd_mask cmd;
 	u64 cached_phc_time;
 	unsigned long cached_phc_jiffies;
 	struct idpf_ptp_dev_clk_regs dev_clk_regs;
@@ -210,6 +216,22 @@ idpf_ptp_info_to_adapter(const struct ptp_clock_info *info)
 	const struct idpf_ptp *ptp = container_of_const(info, struct idpf_ptp,
 							info);
 	return ptp->adapter;
+}
+
+/**
+ * idpf_ptp_mb_access - Get the mailbox access type of the PTP feature
+ * @ptp: PTP specific structure
+ * @mailbox: Capability that indicates the mailbox access
+ *
+ * Used to downgrade a feature that cannot use the direct access.
+ *
+ * Return: mailbox access when the Control Plane advertises it, no access
+ * otherwise.
+ */
+static inline enum idpf_ptp_access
+idpf_ptp_mb_access(const struct idpf_ptp *ptp, u32 mailbox)
+{
+	return ptp->caps & mailbox ? IDPF_PTP_MAILBOX : IDPF_PTP_NONE;
 }
 
 /**
@@ -269,16 +291,17 @@ int idpf_ptp_init(struct idpf_adapter *adapter);
 void idpf_ptp_release(struct idpf_adapter *adapter);
 int idpf_ptp_get_caps(struct idpf_adapter *adapter);
 void idpf_ptp_get_features_access(const struct idpf_adapter *adapter);
+void idpf_ptp_check_features_access(const struct idpf_adapter *adapter);
 bool idpf_ptp_get_txq_tstamp_capability(struct idpf_tx_queue *txq);
-int idpf_ptp_get_dev_clk_time(struct idpf_adapter *adapter,
-			      struct idpf_ptp_dev_timers *dev_clk_time);
-int idpf_ptp_get_cross_time(struct idpf_adapter *adapter,
-			    struct idpf_ptp_dev_timers *cross_time);
-int idpf_ptp_set_dev_clk_time(struct idpf_adapter *adapter, u64 time);
-int idpf_ptp_adj_dev_clk_fine(struct idpf_adapter *adapter, u64 incval);
-int idpf_ptp_adj_dev_clk_time(struct idpf_adapter *adapter, s64 delta);
+int idpf_ptp_get_cross_time_mb(struct idpf_adapter *adapter,
+			       struct idpf_ptp_dev_timers *cross_time);
+int idpf_ptp_get_dev_clk_time_mb(struct idpf_adapter *adapter,
+				 struct idpf_ptp_dev_timers *dev_clk_time);
+int idpf_ptp_set_dev_clk_time_mb(struct idpf_adapter *adapter, u64 time);
+int idpf_ptp_adj_dev_clk_fine_mb(struct idpf_adapter *adapter, u64 incval);
+int idpf_ptp_adj_dev_clk_time_mb(struct idpf_adapter *adapter, s64 delta);
 int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport);
-int idpf_ptp_get_tx_tstamp(struct idpf_vport *vport);
+int idpf_ptp_get_tx_tstamp_mb(struct idpf_vport *vport);
 int idpf_ptp_set_timestamp_mode(struct idpf_vport *vport,
 				struct kernel_hwtstamp_config *config);
 u64 idpf_ptp_extend_ts(struct idpf_vport *vport, u64 in_tstamp);
@@ -302,6 +325,9 @@ static inline int idpf_ptp_get_caps(struct idpf_adapter *adapter)
 static inline void
 idpf_ptp_get_features_access(const struct idpf_adapter *adapter) { }
 
+static inline void
+idpf_ptp_check_features_access(const struct idpf_adapter *adapter) { }
+
 static inline bool
 idpf_ptp_get_txq_tstamp_capability(struct idpf_tx_queue *txq)
 {
@@ -309,33 +335,33 @@ idpf_ptp_get_txq_tstamp_capability(struct idpf_tx_queue *txq)
 }
 
 static inline int
-idpf_ptp_get_dev_clk_time(struct idpf_adapter *adapter,
-			  struct idpf_ptp_dev_timers *dev_clk_time)
+idpf_ptp_get_dev_clk_time_mb(struct idpf_adapter *adapter,
+			     struct idpf_ptp_dev_timers *dev_clk_time)
 {
 	return -EOPNOTSUPP;
 }
 
 static inline int
-idpf_ptp_get_cross_time(struct idpf_adapter *adapter,
-			struct idpf_ptp_dev_timers *cross_time)
+idpf_ptp_get_cross_time_mb(struct idpf_adapter *adapter,
+			   struct idpf_ptp_dev_timers *cross_time)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline int idpf_ptp_set_dev_clk_time(struct idpf_adapter *adapter,
-					    u64 time)
+static inline int idpf_ptp_set_dev_clk_time_mb(struct idpf_adapter *adapter,
+					       u64 time)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline int idpf_ptp_adj_dev_clk_fine(struct idpf_adapter *adapter,
-					    u64 incval)
+static inline int idpf_ptp_adj_dev_clk_fine_mb(struct idpf_adapter *adapter,
+					       u64 incval)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline int idpf_ptp_adj_dev_clk_time(struct idpf_adapter *adapter,
-					    s64 delta)
+static inline int idpf_ptp_adj_dev_clk_time_mb(struct idpf_adapter *adapter,
+					       s64 delta)
 {
 	return -EOPNOTSUPP;
 }
@@ -345,7 +371,7 @@ static inline int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport)
 	return -EOPNOTSUPP;
 }
 
-static inline int idpf_ptp_get_tx_tstamp(struct idpf_vport *vport)
+static inline int idpf_ptp_get_tx_tstamp_mb(struct idpf_vport *vport)
 {
 	return -EOPNOTSUPP;
 }

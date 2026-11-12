@@ -150,8 +150,13 @@ static void idpf_trigger_reset(struct idpf_adapter *adapter,
  */
 static void idpf_ptp_reg_init(const struct idpf_adapter *adapter)
 {
-	adapter->ptp->cmd.shtime_enable_mask = PF_GLTSYN_CMD_SYNC_SHTIME_EN_M;
-	adapter->ptp->cmd.exec_cmd_mask = PF_GLTSYN_CMD_SYNC_EXEC_CMD_M;
+	adapter->ptp->cmd = (struct idpf_ptp_cmd_mask) {
+		.shtime_enable	= PF_GLTSYN_CMD_SYNC_SHTIME_EN_M,
+		.exec_cmd	= PF_GLTSYN_CMD_SYNC_EXEC_CMD_M,
+		.init_time	= PF_GLTSYN_CMD_INIT_TIME_M,
+		.init_incval	= PF_GLTSYN_CMD_INIT_INCVAL_M,
+		.adj_time	= PF_GLTSYN_CMD_ADJ_TIME_M,
+	};
 }
 
 /**

@@ -6,6 +6,30 @@
 #include "idpf_virtchnl.h"
 
 /**
+ * idpf_ptp_regs_access - Get the access type usable with the mapped registers
+ * @ptp: PTP specific structure
+ * @regs: registers the direct access path needs
+ * @num_regs: number of entries in @regs
+ * @mailbox: capability that indicates the mailbox access
+ *
+ * Direct access is only usable when every offset received from the Control
+ * Plane was successfully translated to a BAR address.
+ *
+ * Return: direct access when all registers are mapped, mailbox access when
+ * advertised, no access otherwise.
+ */
+static enum idpf_ptp_access
+idpf_ptp_regs_access(const struct idpf_ptp *ptp, void __iomem * const *regs,
+		     u32 num_regs, u32 mailbox)
+{
+	for (u32 i = 0; i < num_regs; i++)
+		if (!regs[i])
+			return idpf_ptp_mb_access(ptp, mailbox);
+
+	return IDPF_PTP_DIRECT;
+}
+
+/**
  * idpf_ptp_get_caps - Send virtchnl get ptp capabilities message
  * @adapter: Driver specific private structure
  *
@@ -19,7 +43,10 @@ int idpf_ptp_get_caps(struct idpf_adapter *adapter)
 		.caps = cpu_to_le32(VIRTCHNL2_CAP_PTP_GET_DEVICE_CLK_TIME |
 				    VIRTCHNL2_CAP_PTP_GET_DEVICE_CLK_TIME_MB |
 				    VIRTCHNL2_CAP_PTP_GET_CROSS_TIME |
+				    VIRTCHNL2_CAP_PTP_GET_CROSS_TIME_MB |
+				    VIRTCHNL2_CAP_PTP_SET_DEVICE_CLK_TIME |
 				    VIRTCHNL2_CAP_PTP_SET_DEVICE_CLK_TIME_MB |
+				    VIRTCHNL2_CAP_PTP_ADJ_DEVICE_CLK |
 				    VIRTCHNL2_CAP_PTP_ADJ_DEVICE_CLK_MB |
 				    VIRTCHNL2_CAP_PTP_TX_TSTAMPS_MB)
 	};
@@ -35,6 +62,7 @@ int idpf_ptp_get_caps(struct idpf_adapter *adapter)
 	struct idpf_ptp_secondary_mbx *scnd_mbx;
 	struct idpf_ptp *ptp = adapter->ptp;
 	enum idpf_ptp_access access_type;
+	void __iomem *cross_cmd_sync;
 	u32 temp_offset;
 	size_t reply_sz;
 	int err;
@@ -90,6 +118,19 @@ int idpf_ptp_get_caps(struct idpf_adapter *adapter)
 	ptp->dev_clk_regs.cmd_sync =
 		libie_pci_get_mmio_addr(mmio, temp_offset);
 
+	/* Direct access is only usable when every register was mapped. */
+	void __iomem * const clk_regs[] = {
+		ptp->dev_clk_regs.dev_clk_ns_l,
+		ptp->dev_clk_regs.dev_clk_ns_h,
+		ptp->dev_clk_regs.phy_clk_ns_l,
+		ptp->dev_clk_regs.phy_clk_ns_h,
+		ptp->dev_clk_regs.cmd_sync,
+	};
+
+	ptp->get_dev_clk_time_access =
+		idpf_ptp_regs_access(ptp, clk_regs, ARRAY_SIZE(clk_regs),
+				     VIRTCHNL2_CAP_PTP_GET_DEVICE_CLK_TIME_MB);
+
 cross_tstamp:
 	access_type = ptp->get_cross_tstamp_access;
 	if (access_type != IDPF_PTP_DIRECT)
@@ -104,13 +145,31 @@ cross_tstamp:
 	ptp->dev_clk_regs.sys_time_ns_h =
 		libie_pci_get_mmio_addr(mmio, temp_offset);
 	temp_offset = le32_to_cpu(cross_tstamp_offsets.cmd_sync_trigger);
-	ptp->dev_clk_regs.cmd_sync =
-		libie_pci_get_mmio_addr(mmio, temp_offset);
+	cross_cmd_sync = libie_pci_get_mmio_addr(mmio, temp_offset);
+
+	/* The register is shared with the device clock access, so a failed
+	 * translation must not replace the address mapped above.
+	 */
+	if (cross_cmd_sync)
+		ptp->dev_clk_regs.cmd_sync = cross_cmd_sync;
+
+	/* Cross timestamping also samples the device clock registers. */
+	void __iomem * const cross_regs[] = {
+		ptp->dev_clk_regs.dev_clk_ns_l,
+		ptp->dev_clk_regs.dev_clk_ns_h,
+		ptp->dev_clk_regs.sys_time_ns_l,
+		ptp->dev_clk_regs.sys_time_ns_h,
+		cross_cmd_sync,
+	};
+
+	ptp->get_cross_tstamp_access =
+		idpf_ptp_regs_access(ptp, cross_regs, ARRAY_SIZE(cross_regs),
+				     VIRTCHNL2_CAP_PTP_GET_CROSS_TIME_MB);
 
 discipline_clock:
 	access_type = ptp->adj_dev_clk_time_access;
 	if (access_type != IDPF_PTP_DIRECT)
-		goto free_resp;
+		goto check_features_access;
 
 	clk_adj_offsets = recv_ptp_caps_msg->clk_adj_offsets;
 
@@ -143,13 +202,35 @@ discipline_clock:
 	ptp->dev_clk_regs.phy_shadj_h =
 		libie_pci_get_mmio_addr(mmio, temp_offset);
 
+	/* Both the main and the PHY timer are disciplined together. */
+	void __iomem * const adj_regs[] = {
+		ptp->dev_clk_regs.cmd,
+		ptp->dev_clk_regs.incval_l,
+		ptp->dev_clk_regs.incval_h,
+		ptp->dev_clk_regs.shadj_l,
+		ptp->dev_clk_regs.shadj_h,
+		ptp->dev_clk_regs.phy_cmd,
+		ptp->dev_clk_regs.phy_incval_l,
+		ptp->dev_clk_regs.phy_incval_h,
+		ptp->dev_clk_regs.phy_shadj_l,
+		ptp->dev_clk_regs.phy_shadj_h,
+	};
+
+	ptp->adj_dev_clk_time_access =
+		idpf_ptp_regs_access(ptp, adj_regs, ARRAY_SIZE(adj_regs),
+				     VIRTCHNL2_CAP_PTP_ADJ_DEVICE_CLK_MB);
+
+	/* Reconcile dependencies after address validation changed access modes. */
+check_features_access:
+	idpf_ptp_check_features_access(adapter);
+
 free_resp:
 	libie_ctlq_release_rx_buf(&xn_params.recv_mem);
 	return err;
 }
 
 /**
- * idpf_ptp_get_dev_clk_time - Send virtchnl get device clk time message
+ * idpf_ptp_get_dev_clk_time_mb - Send virtchnl get device clk time message
  * @adapter: Driver specific private structure
  * @dev_clk_time: Pointer to the device clock structure where the value is set
  *
@@ -157,8 +238,8 @@ free_resp:
  *
  * Return: 0 on success, -errno otherwise.
  */
-int idpf_ptp_get_dev_clk_time(struct idpf_adapter *adapter,
-			      struct idpf_ptp_dev_timers *dev_clk_time)
+int idpf_ptp_get_dev_clk_time_mb(struct idpf_adapter *adapter,
+				 struct idpf_ptp_dev_timers *dev_clk_time)
 {
 	struct virtchnl2_ptp_get_dev_clk_time *get_dev_clk_time_resp;
 	struct virtchnl2_ptp_get_dev_clk_time get_dev_clk_time_msg;
@@ -191,7 +272,7 @@ free_resp:
 }
 
 /**
- * idpf_ptp_get_cross_time - Send virtchnl get cross time message
+ * idpf_ptp_get_cross_time_mb - Send virtchnl get cross time message
  * @adapter: Driver specific private structure
  * @cross_time: Pointer to the device clock structure where the value is set
  *
@@ -200,8 +281,8 @@ free_resp:
  *
  * Return: 0 on success, -errno otherwise.
  */
-int idpf_ptp_get_cross_time(struct idpf_adapter *adapter,
-			    struct idpf_ptp_dev_timers *cross_time)
+int idpf_ptp_get_cross_time_mb(struct idpf_adapter *adapter,
+			       struct idpf_ptp_dev_timers *cross_time)
 {
 	struct virtchnl2_ptp_get_cross_time cross_time_send, *cross_time_recv;
 	struct libie_ctlq_xn_send_params xn_params = {
@@ -229,7 +310,7 @@ free_resp:
 }
 
 /**
- * idpf_ptp_set_dev_clk_time - Send virtchnl set device time message
+ * idpf_ptp_set_dev_clk_time_mb - Send virtchnl set device time message
  * @adapter: Driver specific private structure
  * @time: New time value
  *
@@ -237,7 +318,7 @@ free_resp:
  *
  * Return: 0 on success, -errno otherwise.
  */
-int idpf_ptp_set_dev_clk_time(struct idpf_adapter *adapter, u64 time)
+int idpf_ptp_set_dev_clk_time_mb(struct idpf_adapter *adapter, u64 time)
 {
 	struct virtchnl2_ptp_set_dev_clk_time set_dev_clk_time_msg = {
 		.dev_time_ns = cpu_to_le64(time),
@@ -257,7 +338,7 @@ int idpf_ptp_set_dev_clk_time(struct idpf_adapter *adapter, u64 time)
 }
 
 /**
- * idpf_ptp_adj_dev_clk_time - Send virtchnl adj device clock time message
+ * idpf_ptp_adj_dev_clk_time_mb - Send virtchnl adj device clock time message
  * @adapter: Driver specific private structure
  * @delta: Offset in nanoseconds to adjust the time by
  *
@@ -265,7 +346,7 @@ int idpf_ptp_set_dev_clk_time(struct idpf_adapter *adapter, u64 time)
  *
  * Return: 0 on success, -errno otherwise.
  */
-int idpf_ptp_adj_dev_clk_time(struct idpf_adapter *adapter, s64 delta)
+int idpf_ptp_adj_dev_clk_time_mb(struct idpf_adapter *adapter, s64 delta)
 {
 	struct virtchnl2_ptp_adj_dev_clk_time adj_dev_clk_time_msg = {
 		.delta = cpu_to_le64(delta),
@@ -285,7 +366,7 @@ int idpf_ptp_adj_dev_clk_time(struct idpf_adapter *adapter, s64 delta)
 }
 
 /**
- * idpf_ptp_adj_dev_clk_fine - Send virtchnl adj time message
+ * idpf_ptp_adj_dev_clk_fine_mb - Send virtchnl adj time message
  * @adapter: Driver specific private structure
  * @incval: Source timer increment value per clock cycle
  *
@@ -294,7 +375,7 @@ int idpf_ptp_adj_dev_clk_time(struct idpf_adapter *adapter, s64 delta)
  *
  * Return: 0 on success, -errno otherwise.
  */
-int idpf_ptp_adj_dev_clk_fine(struct idpf_adapter *adapter, u64 incval)
+int idpf_ptp_adj_dev_clk_fine_mb(struct idpf_adapter *adapter, u64 incval)
 {
 	struct virtchnl2_ptp_adj_dev_clk_fine adj_dev_clk_fine_msg = {
 		.incval = cpu_to_le64(incval),
@@ -612,7 +693,7 @@ unlock:
 }
 
 /**
- * idpf_ptp_get_tx_tstamp - Send virtchnl get Tx timestamp latches message
+ * idpf_ptp_get_tx_tstamp_mb - Send virtchnl get Tx timestamp latches message
  * @vport: Virtual port structure
  *
  * Send virtchnl get Tx tstamp message to read the value of the HW timestamp.
@@ -620,7 +701,7 @@ unlock:
  *
  * Return: 0 on success, -errno otherwise.
  */
-int idpf_ptp_get_tx_tstamp(struct idpf_vport *vport)
+int idpf_ptp_get_tx_tstamp_mb(struct idpf_vport *vport)
 {
 	struct virtchnl2_ptp_get_vport_tx_tstamp_latches *send_tx_tstamp_msg;
 	struct idpf_ptp_vport_tx_tstamp_caps *tx_tstamp_caps;
