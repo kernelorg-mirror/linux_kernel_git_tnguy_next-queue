@@ -48,6 +48,7 @@ int idpf_ptp_get_caps(struct idpf_adapter *adapter)
 				    VIRTCHNL2_CAP_PTP_SET_DEVICE_CLK_TIME_MB |
 				    VIRTCHNL2_CAP_PTP_ADJ_DEVICE_CLK |
 				    VIRTCHNL2_CAP_PTP_ADJ_DEVICE_CLK_MB |
+				    VIRTCHNL2_CAP_PTP_TX_TSTAMPS |
 				    VIRTCHNL2_CAP_PTP_TX_TSTAMPS_MB)
 	};
 	struct libie_ctlq_xn_send_params xn_params = {
@@ -405,22 +406,24 @@ int idpf_ptp_adj_dev_clk_fine_mb(struct idpf_adapter *adapter, u64 incval)
  */
 int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport)
 {
+	struct libie_mmio_info *mmio = &vport->adapter->ctlq_ctx.mmio_info;
 	struct virtchnl2_ptp_get_vport_tx_tstamp_caps send_tx_tstamp_caps;
 	struct virtchnl2_ptp_get_vport_tx_tstamp_caps *rcv_tx_tstamp_caps;
 	struct virtchnl2_ptp_tx_tstamp_latch_caps tx_tstamp_latch_caps;
+	enum idpf_ptp_access tstamp_access, get_dev_clk_access;
 	struct idpf_ptp_vport_tx_tstamp_caps *tstamp_caps;
 	struct idpf_ptp_tx_tstamp *ptp_tx_tstamp, *tmp;
 	struct libie_ctlq_xn_send_params xn_params = {
 		.chnl_opcode = VIRTCHNL2_OP_PTP_GET_VPORT_TX_TSTAMP_CAPS,
 		.timeout_ms = IDPF_VC_XN_DEFAULT_TIMEOUT_MSEC,
 	};
-	enum idpf_ptp_access tstamp_access, get_dev_clk_access;
 	struct idpf_ptp *ptp = vport->adapter->ptp;
 	struct list_head *head;
+	u64 clear_map = 0;
 	size_t reply_sz;
 	u16 num_latches;
+	u32 size, temp;
 	int err = 0;
-	u32 size;
 
 	if (!ptp)
 		return -EOPNOTSUPP;
@@ -458,7 +461,7 @@ int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport)
 		goto get_tstamp_caps_out;
 	}
 
-	tstamp_caps->access = true;
+	tstamp_caps->access = tstamp_access;
 	tstamp_caps->num_entries = num_latches;
 
 	INIT_LIST_HEAD(&tstamp_caps->latches_in_use);
@@ -469,9 +472,22 @@ int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport)
 
 	tstamp_caps->tstamp_ns_lo_bit = rcv_tx_tstamp_caps->tstamp_ns_lo_bit;
 
-	for (u16 i = 0; i < tstamp_caps->num_entries; i++) {
-		__le32 offset_l, offset_h;
+	if (tstamp_access == IDPF_PTP_DIRECT) {
+		temp = le32_to_cpu(rcv_tx_tstamp_caps->readiness_offset_l);
+		tstamp_caps->readiness_addr_l =
+			libie_pci_get_mmio_addr(mmio, temp);
+		temp = le32_to_cpu(rcv_tx_tstamp_caps->readiness_offset_h);
+		tstamp_caps->readiness_addr_h =
+			libie_pci_get_mmio_addr(mmio, temp);
 
+		if (!tstamp_caps->readiness_addr_l ||
+		    !tstamp_caps->readiness_addr_h) {
+			err = -EINVAL;
+			goto err_free_tstamp_caps;
+		}
+	}
+
+	for (u16 i = 0; i < num_latches; i++) {
 		ptp_tx_tstamp = kzalloc_obj(*ptp_tx_tstamp);
 		if (!ptp_tx_tstamp) {
 			err = -ENOMEM;
@@ -483,13 +499,41 @@ int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport)
 		if (tstamp_access != IDPF_PTP_DIRECT)
 			goto skip_offsets;
 
-		offset_l = tx_tstamp_latch_caps.tx_latch_reg_offset_l;
-		offset_h = tx_tstamp_latch_caps.tx_latch_reg_offset_h;
-		ptp_tx_tstamp->tx_latch_reg_offset_l = le32_to_cpu(offset_l);
-		ptp_tx_tstamp->tx_latch_reg_offset_h = le32_to_cpu(offset_h);
+		temp = le32_to_cpu(tx_tstamp_latch_caps.tx_latch_reg_offset_l);
+		ptp_tx_tstamp->tx_latch_reg_addr_l =
+			libie_pci_get_mmio_addr(mmio, temp);
+		temp = le32_to_cpu(tx_tstamp_latch_caps.tx_latch_reg_offset_h);
+		ptp_tx_tstamp->tx_latch_reg_addr_h =
+			libie_pci_get_mmio_addr(mmio, temp);
+
+		if (!ptp_tx_tstamp->tx_latch_reg_addr_l ||
+		    !ptp_tx_tstamp->tx_latch_reg_addr_h) {
+			err = -EINVAL;
+			goto err_free_ptp_tx_tstamp;
+		}
 
 skip_offsets:
+		/* Direct mode uses a 64-bit readiness bitmap, so an index
+		 * outside of its range means the Control Plane sent a
+		 * malformed message and nothing it reported can be trusted.
+		 */
+		if (tstamp_access == IDPF_PTP_DIRECT &&
+		    tx_tstamp_latch_caps.index >= BITS_PER_TYPE(u64)) {
+			pci_err(vport->adapter->pdev,
+				"Tx timestamp latch index %u out of the readiness bitmap range\n",
+				tx_tstamp_latch_caps.index);
+			err = -EINVAL;
+			goto err_free_ptp_tx_tstamp;
+		}
+
 		ptp_tx_tstamp->idx = tx_tstamp_latch_caps.index;
+
+		/* The readiness bits are write-1-to-clear, so collect the ones
+		 * that a previous owner of the latch may have left set. The
+		 * index is only range-checked in the direct mode.
+		 */
+		if (tstamp_access == IDPF_PTP_DIRECT)
+			clear_map |= BIT_ULL(ptp_tx_tstamp->idx);
 
 		list_add(&ptp_tx_tstamp->list_member,
 			 &tstamp_caps->latches_free);
@@ -497,11 +541,17 @@ skip_offsets:
 		tstamp_caps->tx_tstamp_status[i].state = IDPF_PTP_FREE;
 	}
 
+	/* No traffic is flowing yet, so a single write drops every stale bit */
+	if (tstamp_access == IDPF_PTP_DIRECT)
+		idpf_ptp_clear_tx_tstamp_ready(tstamp_caps, clear_map);
+
 	vport->tx_tstamp_caps = tstamp_caps;
 	libie_ctlq_release_rx_buf(&xn_params.recv_mem);
 
 	return 0;
 
+err_free_ptp_tx_tstamp:
+	kfree(ptp_tx_tstamp);
 err_free_ptp_tx_stamp_list:
 	head = &tstamp_caps->latches_free;
 	list_for_each_entry_safe(ptp_tx_tstamp, tmp, head, list_member) {
@@ -509,6 +559,7 @@ err_free_ptp_tx_stamp_list:
 		kfree(ptp_tx_tstamp);
 	}
 
+err_free_tstamp_caps:
 	kfree(tstamp_caps);
 get_tstamp_caps_out:
 	libie_ctlq_release_rx_buf(&xn_params.recv_mem);
@@ -521,8 +572,8 @@ get_tstamp_caps_out:
  *				    the skb compatibility.
  * @caps: Tx timestamp capabilities that monitor the latch status
  * @skb: skb for which the tstamp value is returned through virtchnl message
- * @current_state: Current state of the Tx timestamp latch
- * @expected_state: Expected state of the Tx timestamp latch
+ * @state_before: Current state of the Tx timestamp latch
+ * @state_after: Expected state of the Tx timestamp latch
  *
  * Find a proper skb tracker for which the Tx timestamp is received and change
  * the state to expected value.
@@ -532,24 +583,23 @@ get_tstamp_caps_out:
 static bool
 idpf_ptp_update_tstamp_tracker(struct idpf_ptp_vport_tx_tstamp_caps *caps,
 			       struct sk_buff *skb,
-			       enum idpf_ptp_tx_tstamp_state current_state,
-			       enum idpf_ptp_tx_tstamp_state expected_state)
+			       enum idpf_ptp_tx_tstamp_state state_before,
+			       enum idpf_ptp_tx_tstamp_state state_after)
 {
 	bool updated = false;
 
-	spin_lock(&caps->status_lock);
+	spin_lock_bh(&caps->status_lock);
 	for (u16 i = 0; i < caps->num_entries; i++) {
 		struct idpf_ptp_tx_tstamp_status *status;
 
 		status = &caps->tx_tstamp_status[i];
-
-		if (skb == status->skb && status->state == current_state) {
-			status->state = expected_state;
+		if (skb == status->skb && status->state == state_before) {
+			status->state = state_after;
 			updated = true;
 			break;
 		}
 	}
-	spin_unlock(&caps->status_lock);
+	spin_unlock_bh(&caps->status_lock);
 
 	return updated;
 }

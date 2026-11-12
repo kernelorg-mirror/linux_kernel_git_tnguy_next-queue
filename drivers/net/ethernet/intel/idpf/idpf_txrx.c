@@ -1462,8 +1462,12 @@ static int idpf_vport_init_fast_path_txqs(struct idpf_vport *vport,
 					  struct idpf_q_vec_rsrc *rsrc)
 {
 	struct idpf_ptp_vport_tx_tstamp_caps *caps = vport->tx_tstamp_caps;
-	struct work_struct *tstamp_task = &vport->tstamp_task;
+	struct work_struct *tstamp_task = NULL;
 	int k = 0;
+
+	if (vport->adapter->ptp &&
+	    vport->adapter->ptp->tx_tstamp_access != IDPF_PTP_NONE)
+		tstamp_task = &vport->tstamp_task;
 
 	vport->txqs = kzalloc_objs(*vport->txqs, rsrc->num_txq);
 	if (!vport->txqs)
@@ -2033,7 +2037,8 @@ err_out:
  * @skb: socket buffer to provide Tx timestamp value
  *
  * Schedule a work to read Tx timestamp value generated once the packet is
- * transmitted.
+ * transmitted. In the direct access mode the timestamps are collected by a
+ * periodic timer instead, so that no register access is needed here.
  */
 static void idpf_tx_read_tstamp(struct idpf_tx_queue *txq, struct sk_buff *skb)
 {
@@ -2041,7 +2046,10 @@ static void idpf_tx_read_tstamp(struct idpf_tx_queue *txq, struct sk_buff *skb)
 	struct idpf_ptp_tx_tstamp_status *tx_tstamp_status;
 
 	tx_tstamp_caps = txq->cached_tstamp_caps;
-	spin_lock_bh(&tx_tstamp_caps->status_lock);
+	if (!tx_tstamp_caps || tx_tstamp_caps->access != IDPF_PTP_MAILBOX)
+		return;
+
+	spin_lock(&tx_tstamp_caps->status_lock);
 
 	for (u32 i = 0; i < tx_tstamp_caps->num_entries; i++) {
 		tx_tstamp_status = &tx_tstamp_caps->tx_tstamp_status[i];
@@ -2058,7 +2066,7 @@ static void idpf_tx_read_tstamp(struct idpf_tx_queue *txq, struct sk_buff *skb)
 		break;
 	}
 
-	spin_unlock_bh(&tx_tstamp_caps->status_lock);
+	spin_unlock(&tx_tstamp_caps->status_lock);
 }
 
 #define idpf_tx_splitq_clean_bump_ntc(txq, ntc, desc, buf)	\
@@ -2982,6 +2990,13 @@ static int idpf_tx_tstamp(struct idpf_tx_queue *tx_q, struct sk_buff *skb,
 
 	/* only timestamp the outbound packet if the user has requested it */
 	if (likely(!(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)))
+		return -1;
+
+	/* Cheap check to skip the latches lock, the authoritative one is done
+	 * under it by idpf_ptp_request_ts().
+	 */
+	if (READ_ONCE(idpf_netdev_to_vport(tx_q->netdev)->tstamp_config.tx_type) !=
+	    HWTSTAMP_TX_ON)
 		return -1;
 
 	if (!idpf_ptp_get_txq_tstamp_capability(tx_q))

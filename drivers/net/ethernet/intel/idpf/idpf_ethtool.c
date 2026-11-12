@@ -1739,8 +1739,9 @@ unlock:
  * @ts_stats: HW timestamping stats structure
  *
  * Collect HW timestamping statistics including successfully timestamped
- * packets, discarded due to illegal values, flushed during releasing PTP and
- * skipped due to lack of the free index.
+ * packets, discarded due to illegal values, flushed during releasing PTP,
+ * expired because the hardware never latched a timestamp and skipped due to
+ * lack of the free index.
  */
 static void idpf_get_ts_stats(struct net_device *netdev,
 			      struct ethtool_ts_stats *ts_stats)
@@ -1755,7 +1756,8 @@ static void idpf_get_ts_stats(struct net_device *netdev,
 	do {
 		start = u64_stats_fetch_begin(&vport->tstamp_stats.stats_sync);
 		ts_stats->pkts = u64_stats_read(&vport->tstamp_stats.packets);
-		ts_stats->lost = u64_stats_read(&vport->tstamp_stats.flushed);
+		ts_stats->lost = u64_stats_read(&vport->tstamp_stats.flushed) +
+				 u64_stats_read(&vport->tstamp_stats.expired);
 		ts_stats->err = u64_stats_read(&vport->tstamp_stats.discarded);
 	} while (u64_stats_fetch_retry(&vport->tstamp_stats.stats_sync, start));
 

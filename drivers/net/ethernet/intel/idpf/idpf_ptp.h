@@ -6,6 +6,17 @@
 
 #include <linux/ptp_clock_kernel.h>
 
+/* Layout of the Tx timestamp latch registers, mandated by the IDPF
+ * specification. Only the register offsets are negotiated with the Control
+ * Plane, the field placement within them is fixed:
+ * Low register:  bit[0] = valid, bit[31:1] = timestamp bits [30:0]
+ * High register: bit[7:0] = timestamp bits [38:31]
+ */
+#define IDPF_PTP_TX_TSTAMP_L_VALID_M	BIT(0)
+#define IDPF_PTP_TX_TSTAMP_L_TSTAMP_M	GENMASK(31, 1)
+#define IDPF_PTP_TX_TSTAMP_H_TSTAMP_M	GENMASK(7, 0)
+#define IDPF_PTP_TX_TSTAMP_H_POS_M	GENMASK_ULL(38, 31)
+
 /**
  * struct idpf_ptp_cmd_mask - PTP command masks
  * @exec_cmd: mask to trigger command execution
@@ -122,40 +133,48 @@ struct idpf_ptp_tx_tstamp_status {
 /**
  * struct idpf_ptp_tx_tstamp - Parameters for Tx timestamping
  * @list_member: the list member structure
- * @tx_latch_reg_offset_l: Tx tstamp latch low register offset
- * @tx_latch_reg_offset_h: Tx tstamp latch high register offset
+ * @tx_latch_reg_addr_l: Tx tstamp latch low register address
+ * @tx_latch_reg_addr_h: Tx tstamp latch high register address
  * @skb: the pointer to the SKB for this timestamp request
  * @tstamp: the Tx tstamp value
+ * @deadline: time after which the latch is reclaimed even if the hardware has
+ *	      not reported the timestamp
  * @idx: the index of the Tx tstamp
  */
 struct idpf_ptp_tx_tstamp {
 	struct list_head list_member;
-	u32 tx_latch_reg_offset_l;
-	u32 tx_latch_reg_offset_h;
+	void __iomem *tx_latch_reg_addr_l;
+	void __iomem *tx_latch_reg_addr_h;
 	struct sk_buff *skb;
 	u64 tstamp;
+	unsigned long deadline;
 	u32 idx;
 };
 
 /**
  * struct idpf_ptp_vport_tx_tstamp_caps - Tx timestamp capabilities
- * @vport_id: the vport id
  * @num_entries: the number of negotiated Tx timestamp entries
  * @tstamp_ns_lo_bit: first bit for nanosecond part of the timestamp
- * @latches_lock: the lock to the lists of free/used timestamp indexes
- * @status_lock: the lock to the status tracker
- * @access: indicates an access to Tx timestamp
+ * @access: the type of the supported access to Tx timestamp
+ * @latches_lock: the lock to the lists of free/used timestamp indexes. Taken
+ *		  from the Tx path and from the timestamp collection timer, so
+ *		  process context users must disable bottom halves
+ * @status_lock: the lock to the status tracker. Mailbox access only, also
+ *		 taken from the NAPI completion path
+ * @readiness_addr_l: Tx tstamp readiness bitmap low register address
+ * @readiness_addr_h: Tx tstamp readiness bitmap high register address
  * @latches_free: the list of the free Tx timestamps latches
  * @latches_in_use: the list of the used Tx timestamps latches
  * @tx_tstamp_status: Tx tstamp status tracker
  */
 struct idpf_ptp_vport_tx_tstamp_caps {
-	u32 vport_id;
 	u16 num_entries;
 	u16 tstamp_ns_lo_bit;
+	enum idpf_ptp_access access;
 	spinlock_t latches_lock;
 	spinlock_t status_lock;
-	bool access:1;
+	void __iomem *readiness_addr_l;
+	void __iomem *readiness_addr_h;
 	struct list_head latches_free;
 	struct list_head latches_in_use;
 	struct idpf_ptp_tx_tstamp_status tx_tstamp_status[];
@@ -302,12 +321,18 @@ int idpf_ptp_adj_dev_clk_fine_mb(struct idpf_adapter *adapter, u64 incval);
 int idpf_ptp_adj_dev_clk_time_mb(struct idpf_adapter *adapter, s64 delta);
 int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport);
 int idpf_ptp_get_tx_tstamp_mb(struct idpf_vport *vport);
+void
+idpf_ptp_clear_tx_tstamp_ready(struct idpf_ptp_vport_tx_tstamp_caps *caps,
+			       u64 map);
 int idpf_ptp_set_timestamp_mode(struct idpf_vport *vport,
 				struct kernel_hwtstamp_config *config);
 u64 idpf_ptp_extend_ts(struct idpf_vport *vport, u64 in_tstamp);
 u64 idpf_ptp_tstamp_extend_32b_to_64b(u64 cached_phc_time, u32 in_timestamp);
 int idpf_ptp_request_ts(struct idpf_tx_queue *tx_q, struct sk_buff *skb,
 			u32 *idx);
+void idpf_ptp_tx_tstamp_timer_init(struct idpf_vport *vport);
+void idpf_ptp_tx_tstamp_start(struct idpf_vport *vport);
+void idpf_ptp_tx_tstamp_stop(struct idpf_vport *vport);
 void idpf_tstamp_task(struct work_struct *work);
 #else /* CONFIG_PTP_1588_CLOCK */
 static inline int idpf_ptp_init(struct idpf_adapter *adapter)
@@ -400,6 +425,13 @@ static inline int idpf_ptp_request_ts(struct idpf_tx_queue *tx_q,
 	return -EOPNOTSUPP;
 }
 
+static inline void idpf_ptp_tx_tstamp_timer_init(struct idpf_vport *vport) { }
+
+static inline void idpf_ptp_tx_tstamp_start(struct idpf_vport *vport) { }
+
+static inline void idpf_ptp_tx_tstamp_stop(struct idpf_vport *vport) { }
+
 static inline void idpf_tstamp_task(struct work_struct *work) { }
+
 #endif /* CONFIG_PTP_1588_CLOCK */
 #endif /* _IDPF_PTP_H */

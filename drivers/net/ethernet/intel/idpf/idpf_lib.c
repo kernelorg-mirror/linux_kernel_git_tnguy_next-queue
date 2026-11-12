@@ -851,6 +851,7 @@ static void idpf_vport_stop(struct idpf_vport *vport, bool rtnl)
 
 	idpf_send_disable_vport_msg(adapter, vport_id);
 	idpf_send_disable_queues_msg(vport);
+	idpf_ptp_tx_tstamp_stop(vport);
 	idpf_send_map_unmap_queue_vector_msg(adapter, rsrc, vport_id, false);
 	/* Normally we ask for queues in create_vport, but if the number of
 	 * initially requested queues have changed, for example via ethtool
@@ -1453,6 +1454,7 @@ static int idpf_vport_open(struct idpf_vport *vport, bool rtnl)
 		goto disable_vport;
 	}
 
+	idpf_ptp_tx_tstamp_start(vport);
 	idpf_up_complete(vport);
 
 	if (rtnl)

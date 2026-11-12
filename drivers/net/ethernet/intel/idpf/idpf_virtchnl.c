@@ -3365,7 +3365,17 @@ int idpf_vport_init(struct idpf_vport *vport, struct idpf_vport_max_q *max_q)
 		return 0;
 	}
 
-	INIT_WORK(&vport->tstamp_task, idpf_tstamp_task);
+	switch (vport->adapter->ptp->tx_tstamp_access) {
+	case IDPF_PTP_MAILBOX:
+		INIT_WORK(&vport->tstamp_task, idpf_tstamp_task);
+		break;
+	case IDPF_PTP_DIRECT:
+		idpf_ptp_tx_tstamp_timer_init(vport);
+		break;
+	case IDPF_PTP_NONE:
+	default:
+		break;
+	}
 
 	return 0;
 }

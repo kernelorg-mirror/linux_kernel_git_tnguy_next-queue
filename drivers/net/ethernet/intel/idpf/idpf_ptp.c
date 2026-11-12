@@ -4,6 +4,16 @@
 #include "idpf.h"
 #include "idpf_ptp.h"
 
+/* Period of the Tx timestamp collection. Way below the jiffy granularity, as
+ * a timestamp reported late skews the PTP error bounds.
+ */
+#define IDPF_PTP_TX_TSTAMP_PERIOD_NS		(100 * NSEC_PER_USEC)
+
+/* Time after which a Tx timestamp that the hardware has never latched is
+ * given up on, e.g. when the packet was dropped inside the device.
+ */
+#define IDPF_PTP_TX_TSTAMP_TIMEOUT		msecs_to_jiffies(500)
+
 /**
  * idpf_ptp_get_access - Determine the access type of the PTP features
  * @adapter: Driver specific private structure
@@ -821,6 +831,55 @@ u64 idpf_ptp_extend_ts(struct idpf_vport *vport, u64 in_tstamp)
 }
 
 /**
+ * idpf_ptp_clear_tx_tstamp_ready - Clear the readiness bits of Tx latches
+ * @caps: Tx timestamp capabilities of the vport
+ * @map: bitmap of the latch indexes to clear
+ *
+ * The readiness bits are write-1-to-clear and are not cleared by reading the
+ * latch registers, so a bit left behind would make the next user of the same
+ * index report the timestamp of the previous packet. Only the bits set in
+ * @map are written, as the remaining ones may belong to latches that are
+ * still waiting to be read.
+ */
+void idpf_ptp_clear_tx_tstamp_ready(struct idpf_ptp_vport_tx_tstamp_caps *caps,
+				    u64 map)
+{
+	u32 map_l = lower_32_bits(map);
+	u32 map_h = upper_32_bits(map);
+
+	/* Flush the posted writes, the bits have to be cleared in the
+	 * hardware before the indexes are handed out again.
+	 */
+	if (map_l) {
+		writel(map_l, caps->readiness_addr_l);
+		readl(caps->readiness_addr_l);
+	}
+
+	if (map_h) {
+		writel(map_h, caps->readiness_addr_h);
+		readl(caps->readiness_addr_h);
+	}
+}
+
+/**
+ * idpf_ptp_read_tx_tstamp_readiness - Read the Tx timestamp readiness bitmap
+ * @caps: Tx timestamp capabilities of the vport
+ *
+ * Return: bitmap of the latch indexes for which the hardware has reported
+ * a timestamp.
+ */
+static u64
+idpf_ptp_read_tx_tstamp_readiness(struct idpf_ptp_vport_tx_tstamp_caps *caps)
+{
+	u32 readiness_l, readiness_h;
+
+	readiness_l = readl(caps->readiness_addr_l);
+	readiness_h = readl(caps->readiness_addr_h);
+
+	return ((u64)readiness_h << 32) | readiness_l;
+}
+
+/**
  * idpf_ptp_request_ts - Request an available Tx timestamp index
  * @tx_q: Transmit queue on which the Tx timestamp is requested
  * @skb: The SKB to associate with this timestamp request
@@ -835,15 +894,30 @@ u64 idpf_ptp_extend_ts(struct idpf_vport *vport, u64 in_tstamp)
 int idpf_ptp_request_ts(struct idpf_tx_queue *tx_q, struct sk_buff *skb,
 			u32 *idx)
 {
+	struct idpf_ptp_vport_tx_tstamp_caps *tstamp_caps;
 	struct idpf_ptp_tx_tstamp *ptp_tx_tstamp;
+	struct idpf_vport *vport;
 	struct list_head *head;
 
-	/* Get the index from the free latches list */
-	spin_lock(&tx_q->cached_tstamp_caps->latches_lock);
+	tstamp_caps = tx_q->cached_tstamp_caps;
+	vport = idpf_netdev_to_vport(tx_q->netdev);
 
-	head = &tx_q->cached_tstamp_caps->latches_free;
+	spin_lock(&tstamp_caps->latches_lock);
+
+	/* Disabling the Tx timestamping flushes the latches under this lock,
+	 * so one taken here is always collected or flushed.
+	 */
+	if (READ_ONCE(vport->tstamp_config.tx_type) != HWTSTAMP_TX_ON) {
+		spin_unlock(&tstamp_caps->latches_lock);
+
+		return -EPERM;
+	}
+
+	/* Get the index from the free latches list */
+	head = &tstamp_caps->latches_free;
 	if (list_empty(head)) {
-		spin_unlock(&tx_q->cached_tstamp_caps->latches_lock);
+		spin_unlock(&tstamp_caps->latches_lock);
+
 		return -ENOBUFS;
 	}
 
@@ -851,17 +925,294 @@ int idpf_ptp_request_ts(struct idpf_tx_queue *tx_q, struct sk_buff *skb,
 					 list_member);
 	list_del(&ptp_tx_tstamp->list_member);
 
+	ptp_tx_tstamp->deadline = jiffies + IDPF_PTP_TX_TSTAMP_TIMEOUT;
 	ptp_tx_tstamp->skb = skb_get(skb);
 	skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
 
 	/* Move the element to the used latches list */
-	list_add(&ptp_tx_tstamp->list_member,
-		 &tx_q->cached_tstamp_caps->latches_in_use);
-	spin_unlock(&tx_q->cached_tstamp_caps->latches_lock);
+	list_add(&ptp_tx_tstamp->list_member, &tstamp_caps->latches_in_use);
 
 	*idx = ptp_tx_tstamp->idx;
 
+	spin_unlock(&tstamp_caps->latches_lock);
+
 	return 0;
+}
+
+/**
+ * idpf_ptp_read_tx_tstamp - Read and extract timestamp from latch registers
+ * @tstamp_caps: Tx timestamp capabilities of the vport
+ * @tx_tstamp: Tx timestamp structure with latch register addresses
+ *
+ * Read the timestamp from the latch registers, whose layout the IDPF
+ * specification defines as:
+ *   low  bit[0]   : valid flag
+ *   low  bit[31:1]: timestamp bits [30:0]
+ *   high bit[7:0] : timestamp bits [38:31]
+ * Together they form a 39-bit timestamp, which is then shifted right by
+ * tstamp_ns_lo_bit to remove sub-nanosecond precision bits.
+ *
+ * The caller has already found the latch index set in the readiness bitmap,
+ * which is preferred over the per-latch valid flag because it covers every
+ * latch in a single pair of reads. The valid flag is still checked here, as
+ * the hardware may overwrite a latch whose readiness bit has been left set.
+ *
+ * @latches_lock must be held across the readiness check, this call and the
+ * subsequent clearing of the readiness bit, to keep the index from being
+ * recycled in between.
+ *
+ * Return: extracted timestamp value in nanoseconds, 0 if the latch does not
+ * hold a valid timestamp.
+ */
+static u64
+idpf_ptp_read_tx_tstamp(struct idpf_ptp_vport_tx_tstamp_caps *tstamp_caps,
+			struct idpf_ptp_tx_tstamp *tx_tstamp)
+{
+	u32 tstamp_l, tstamp_h;
+	u64 tstamp;
+
+	lockdep_assert_held(&tstamp_caps->latches_lock);
+
+	tstamp_l = readl(tx_tstamp->tx_latch_reg_addr_l);
+	tstamp_h = readl(tx_tstamp->tx_latch_reg_addr_h);
+
+	if (unlikely(!(tstamp_l & IDPF_PTP_TX_TSTAMP_L_VALID_M)))
+		return 0;
+
+	tstamp = FIELD_GET(IDPF_PTP_TX_TSTAMP_L_TSTAMP_M, tstamp_l);
+	tstamp |= FIELD_PREP(IDPF_PTP_TX_TSTAMP_H_POS_M,
+			     FIELD_GET(IDPF_PTP_TX_TSTAMP_H_TSTAMP_M, tstamp_h));
+
+	return tstamp >> tstamp_caps->tstamp_ns_lo_bit;
+}
+
+/**
+ * idpf_ptp_report_tx_tstamp - Report timestamp to stack and update stats
+ * @vport: Virtual port structure
+ * @skb: Socket buffer to report timestamp for
+ * @tstamp: Raw timestamp value to extend and report
+ *
+ * Extend the 39-bit hardware timestamp to 64-bit, report to stack via
+ * skb_tstamp_tx(), and update packet statistics.
+ */
+static void idpf_ptp_report_tx_tstamp(struct idpf_vport *vport,
+				      struct sk_buff *skb, u64 tstamp)
+{
+	struct skb_shared_hwtstamps shhwtstamps;
+	u64 extended_tstamp;
+
+	extended_tstamp = idpf_ptp_extend_ts(vport, tstamp);
+	if (!extended_tstamp)
+		goto consume;
+
+	shhwtstamps = (struct skb_shared_hwtstamps){
+		.hwtstamp	= ns_to_ktime(extended_tstamp),
+	};
+
+	skb_tstamp_tx(skb, &shhwtstamps);
+
+	u64_stats_update_begin(&vport->tstamp_stats.stats_sync);
+	u64_stats_inc(&vport->tstamp_stats.packets);
+	u64_stats_update_end(&vport->tstamp_stats.stats_sync);
+
+consume:
+	consume_skb(skb);
+}
+
+/**
+ * idpf_ptp_get_tx_tstamp_direct - Read timestamps directly from HW registers
+ * @vport: Virtual port structure
+ *
+ * Collect the latches for which the hardware has reported a timestamp, as
+ * well as the ones that have not been reported before their deadline, and
+ * hand them over to the stack. A packet dropped inside the device never
+ * latches a timestamp, so without the deadline its latch would never be
+ * reclaimed.
+ *
+ * The latches are detached from the in-use list before the lock is dropped,
+ * so that their skbs can be reported without the index being recycled in the
+ * meantime.
+ */
+static void idpf_ptp_get_tx_tstamp_direct(struct idpf_vport *vport)
+{
+	struct idpf_ptp_vport_tx_tstamp_caps *tstamp_caps;
+	struct idpf_ptp_tx_tstamp *ptp_tx_tstamp, *tmp;
+	u64 readiness_bitmap, clear_map = 0;
+	LIST_HEAD(done);
+
+	tstamp_caps = vport->tx_tstamp_caps;
+
+	spin_lock(&tstamp_caps->latches_lock);
+
+	if (list_empty(&tstamp_caps->latches_in_use)) {
+		spin_unlock(&tstamp_caps->latches_lock);
+		return;
+	}
+
+	readiness_bitmap = idpf_ptp_read_tx_tstamp_readiness(tstamp_caps);
+
+	list_for_each_entry_safe(ptp_tx_tstamp, tmp,
+				 &tstamp_caps->latches_in_use, list_member) {
+		u32 idx = ptp_tx_tstamp->idx;
+
+		ptp_tx_tstamp->tstamp = 0;
+
+		if (readiness_bitmap & BIT_ULL(idx)) {
+			ptp_tx_tstamp->tstamp =
+				idpf_ptp_read_tx_tstamp(tstamp_caps,
+							ptp_tx_tstamp);
+			/* Keep the bit set if the latch holds no valid
+			 * timestamp yet, so that it is read again.
+			 */
+			if (ptp_tx_tstamp->tstamp)
+				clear_map |= BIT_ULL(idx);
+		}
+
+		/* A latch with no timestamp is kept in use until its deadline
+		 * passes, as the hardware may still be about to report it.
+		 * Once it does, drop its readiness bit as well, so that the
+		 * next user of the index is not given a stale timestamp if
+		 * the hardware reports one after the latch has been reclaimed.
+		 */
+		if (!ptp_tx_tstamp->tstamp) {
+			if (time_is_after_jiffies(ptp_tx_tstamp->deadline))
+				continue;
+
+			clear_map |= BIT_ULL(idx);
+		}
+
+		list_move(&ptp_tx_tstamp->list_member, &done);
+	}
+
+	/* The indexes are not recycled before the splice below, so the bits
+	 * of every latch read above can be dropped in a single write.
+	 */
+	idpf_ptp_clear_tx_tstamp_ready(tstamp_caps, clear_map);
+
+	spin_unlock(&tstamp_caps->latches_lock);
+
+	list_for_each_entry(ptp_tx_tstamp, &done, list_member) {
+		if (ptp_tx_tstamp->tstamp) {
+			idpf_ptp_report_tx_tstamp(vport, ptp_tx_tstamp->skb,
+						  ptp_tx_tstamp->tstamp);
+		} else {
+			u64_stats_update_begin(&vport->tstamp_stats.stats_sync);
+			u64_stats_inc(&vport->tstamp_stats.expired);
+			u64_stats_update_end(&vport->tstamp_stats.stats_sync);
+
+			net_warn_ratelimited("%s: Tx timestamp for latch %u never arrived\n",
+					     vport->netdev->name,
+					     ptp_tx_tstamp->idx);
+
+			dev_kfree_skb_any(ptp_tx_tstamp->skb);
+		}
+
+		ptp_tx_tstamp->skb = NULL;
+	}
+
+	spin_lock(&tstamp_caps->latches_lock);
+	list_splice(&done, &tstamp_caps->latches_free);
+	spin_unlock(&tstamp_caps->latches_lock);
+}
+
+/**
+ * idpf_ptp_tx_tstamp_timer_cb - Periodically collect the Tx timestamps
+ * @timer: Tx timestamp collection timer
+ *
+ * Return: HRTIMER_RESTART to keep collecting at a fixed period.
+ */
+static enum hrtimer_restart idpf_ptp_tx_tstamp_timer_cb(struct hrtimer *timer)
+{
+	struct idpf_vport *vport;
+
+	vport = container_of(timer, struct idpf_vport, tx_tstamp_timer);
+
+	idpf_ptp_get_tx_tstamp_direct(vport);
+	hrtimer_forward_now(timer, IDPF_PTP_TX_TSTAMP_PERIOD_NS);
+
+	return HRTIMER_RESTART;
+}
+
+/**
+ * idpf_ptp_tx_tstamp_timer_init - Set up the Tx timestamp collection timer
+ * @vport: Virtual port structure
+ */
+void idpf_ptp_tx_tstamp_timer_init(struct idpf_vport *vport)
+{
+	hrtimer_setup(&vport->tx_tstamp_timer, idpf_ptp_tx_tstamp_timer_cb,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+}
+
+/**
+ * idpf_ptp_tx_tstamp_start - Start collecting the Tx timestamps
+ * @vport: Virtual port structure
+ *
+ * In the direct mode nothing in the Tx path reads the latches, so the
+ * collection is driven by a timer that runs for as long as the Tx
+ * timestamping is enabled and the vport is up.
+ */
+void idpf_ptp_tx_tstamp_start(struct idpf_vport *vport)
+{
+	if (!idpf_ptp_is_vport_tx_tstamp_ena(vport) ||
+	    vport->tx_tstamp_caps->access != IDPF_PTP_DIRECT)
+		return;
+
+	/* The callback re-arms itself, so it must be finished before the timer
+	 * is started again, e.g. when only the Rx filter is being changed.
+	 */
+	if (READ_ONCE(vport->tstamp_config.tx_type) == HWTSTAMP_TX_ON) {
+		hrtimer_cancel(&vport->tx_tstamp_timer);
+		hrtimer_start(&vport->tx_tstamp_timer,
+			      IDPF_PTP_TX_TSTAMP_PERIOD_NS,
+			      HRTIMER_MODE_REL_SOFT);
+	}
+}
+
+/**
+ * idpf_ptp_tx_tstamp_stop - Stop collecting the Tx timestamps
+ * @vport: Virtual port structure
+ *
+ * Stop the collection timer and flush the latches that are still waiting for
+ * a timestamp, as nothing would collect them anymore. No new latch is handed
+ * out afterwards, either because the Tx timestamping has been disabled, which
+ * idpf_ptp_request_ts() checks under the latches lock, or because the Tx path
+ * is stopped.
+ */
+void idpf_ptp_tx_tstamp_stop(struct idpf_vport *vport)
+{
+	struct idpf_ptp_vport_tx_tstamp_caps *tstamp_caps;
+	struct idpf_ptp_tx_tstamp *ptp_tx_tstamp, *tmp;
+	u64 clear_map = 0;
+
+	if (!idpf_ptp_is_vport_tx_tstamp_ena(vport) ||
+	    vport->tx_tstamp_caps->access != IDPF_PTP_DIRECT)
+		return;
+
+	tstamp_caps = vport->tx_tstamp_caps;
+
+	hrtimer_cancel(&vport->tx_tstamp_timer);
+
+	spin_lock_bh(&tstamp_caps->latches_lock);
+
+	u64_stats_update_begin(&vport->tstamp_stats.stats_sync);
+	list_for_each_entry_safe(ptp_tx_tstamp, tmp,
+				 &tstamp_caps->latches_in_use, list_member) {
+		u64_stats_inc(&vport->tstamp_stats.flushed);
+
+		clear_map |= BIT_ULL(ptp_tx_tstamp->idx);
+
+		if (ptp_tx_tstamp->skb)
+			consume_skb(ptp_tx_tstamp->skb);
+
+		ptp_tx_tstamp->skb = NULL;
+		list_move(&ptp_tx_tstamp->list_member,
+			  &tstamp_caps->latches_free);
+	}
+	u64_stats_update_end(&vport->tstamp_stats.stats_sync);
+
+	idpf_ptp_clear_tx_tstamp_ready(tstamp_caps, clear_map);
+
+	spin_unlock_bh(&tstamp_caps->latches_lock);
 }
 
 /**
@@ -923,12 +1274,21 @@ int idpf_ptp_set_timestamp_mode(struct idpf_vport *vport,
 	case HWTSTAMP_TX_ON:
 		if (!idpf_ptp_is_vport_tx_tstamp_ena(vport))
 			return -EINVAL;
+
 		break;
 	default:
 		return -EINVAL;
 	}
 
-	vport->tstamp_config.tx_type = config->tx_type;
+	/* Publish the new mode first, so that the Tx path stops handing out
+	 * latches, then flush the ones that are still waiting.
+	 */
+	WRITE_ONCE(vport->tstamp_config.tx_type, config->tx_type);
+	if (config->tx_type == HWTSTAMP_TX_ON)
+		idpf_ptp_tx_tstamp_start(vport);
+	else
+		idpf_ptp_tx_tstamp_stop(vport);
+
 	idpf_ptp_set_rx_tstamp(vport, config->rx_filter);
 	*config = vport->tstamp_config;
 
@@ -1035,8 +1395,19 @@ static void idpf_ptp_release_vport_tstamp(struct idpf_vport *vport)
 {
 	struct idpf_ptp_tx_tstamp *ptp_tx_tstamp, *tmp;
 	struct list_head *head;
+	u64 clear_map = 0;
 
-	cancel_work_sync(&vport->tstamp_task);
+	switch (vport->tx_tstamp_caps->access) {
+	case IDPF_PTP_MAILBOX:
+		cancel_work_sync(&vport->tstamp_task);
+		break;
+	case IDPF_PTP_DIRECT:
+		hrtimer_cancel(&vport->tx_tstamp_timer);
+		break;
+	case IDPF_PTP_NONE:
+	default:
+		break;
+	}
 
 	/* Remove list with free latches */
 	spin_lock_bh(&vport->tx_tstamp_caps->latches_lock);
@@ -1053,6 +1424,10 @@ static void idpf_ptp_release_vport_tstamp(struct idpf_vport *vport)
 	list_for_each_entry_safe(ptp_tx_tstamp, tmp, head, list_member) {
 		u64_stats_inc(&vport->tstamp_stats.flushed);
 
+		/* The index is only range-checked in the direct mode */
+		if (vport->tx_tstamp_caps->access == IDPF_PTP_DIRECT)
+			clear_map |= BIT_ULL(ptp_tx_tstamp->idx);
+
 		list_del(&ptp_tx_tstamp->list_member);
 		if (ptp_tx_tstamp->skb)
 			consume_skb(ptp_tx_tstamp->skb);
@@ -1060,6 +1435,10 @@ static void idpf_ptp_release_vport_tstamp(struct idpf_vport *vport)
 		kfree(ptp_tx_tstamp);
 	}
 	u64_stats_update_end(&vport->tstamp_stats.stats_sync);
+
+	if (vport->tx_tstamp_caps->access == IDPF_PTP_DIRECT)
+		idpf_ptp_clear_tx_tstamp_ready(vport->tx_tstamp_caps,
+					       clear_map);
 
 	spin_unlock_bh(&vport->tx_tstamp_caps->latches_lock);
 
@@ -1098,10 +1477,8 @@ bool idpf_ptp_get_txq_tstamp_capability(struct idpf_tx_queue *txq)
 {
 	if (!txq || !txq->cached_tstamp_caps)
 		return false;
-	else if (txq->cached_tstamp_caps->access)
-		return true;
-	else
-		return false;
+
+	return txq->cached_tstamp_caps->access != IDPF_PTP_NONE;
 }
 
 /**
