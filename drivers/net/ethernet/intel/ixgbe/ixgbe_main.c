@@ -10999,12 +10999,6 @@ static int ixgbe_xdp_setup(struct net_device *dev, struct bpf_prog *prog)
 			return -EINVAL;
 	}
 
-	/* if the number of cpus is much larger than the maximum of queues,
-	 * we should stop it and then return with ENOMEM like before.
-	 */
-	if (nr_cpu_ids > IXGBE_MAX_XDP_QS * 2)
-		return -ENOMEM;
-
 	old_prog = xchg(&adapter->xdp_prog, prog);
 	need_reset = (!!prog != !!old_prog);
 
