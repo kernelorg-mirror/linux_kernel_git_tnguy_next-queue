@@ -53,6 +53,8 @@ static int ice_adapter_init(void *priv, void *init_param)
 	spin_lock_init(&adapter->ports.lock);
 	INIT_LIST_HEAD(&adapter->ports.list);
 
+	mutex_init(&adapter->ps_lock);
+
 	return init_srcu_struct(&adapter->ports.srcu);
 }
 
@@ -66,6 +68,7 @@ static void ice_adapter_fini(void *priv)
 	mutex_destroy(&adapter->cgu_synce_lock);
 
 	cleanup_srcu_struct(&adapter->ports.srcu);
+	mutex_destroy(&adapter->ps_lock);
 }
 
 static const struct devlink_ops ice_adapter_devlink_ops = {
