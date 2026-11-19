@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright Red Hat
 
 #include <linux/pci.h>
+#include <linux/seqlock.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/srcu.h>
@@ -57,6 +58,9 @@ static int ice_adapter_init(void *priv, void *init_param)
 
 	mutex_init(&adapter->ps_lock);
 
+	seqcount_latch_init(&adapter->phc.seq);
+	mutex_init(&adapter->phc.lock);
+
 	return init_srcu_struct(&adapter->ports.srcu);
 }
 
@@ -72,6 +76,8 @@ static void ice_adapter_fini(void *priv)
 
 	cleanup_srcu_struct(&adapter->ports.srcu);
 	mutex_destroy(&adapter->ps_lock);
+
+	mutex_destroy(&adapter->phc.lock);
 }
 
 static const struct devlink_ops ice_adapter_devlink_ops = {

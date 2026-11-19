@@ -7,6 +7,7 @@
 #include <linux/types.h>
 #include <linux/mutex.h>
 #include <linux/rwsem.h>
+#include <linux/seqlock.h>
 #include <linux/srcu.h>
 #include <linux/spinlock_types.h>
 
@@ -36,6 +37,38 @@ struct ice_port_list {
 };
 
 /**
+ * struct ice_phc - PTP Hardware Clock fields
+ *
+ * Structure used for handling the timestamp extension logic for this device.
+ *
+ * Legacy timestamp extension fields:
+ * @cached_time: Cached copy of the PHC time for timestamp extension
+ *
+ * General fields:
+ * @update_time: Monotonic time when PHC was laste updated
+ * @seq: seqcount_latch_t used to protect readers, directing them to the
+ *       secondary copy during an update.
+ * @lock: For protecting updates to the PHC fields.
+ *
+ * Readers are lockless and rely on the latched sequence counter for
+ * a consistent view of the most recent update, even if they interrupt
+ * a writer.
+ *
+ * Writers must acquire the lock mutex to ensure that the periodic task cannot
+ * race with clock adjustment callbacks.
+ */
+struct ice_phc {
+	/* Legacy timestamp extension fields */
+	u64 cached_time[2];
+
+	/* General fields */
+	ktime_t update_time[2];
+	seqcount_latch_t seq;
+	/* Serialize updates to cached_time */
+	struct mutex lock;
+};
+
+/**
  * struct ice_adapter - PCI adapter resources shared across PFs
  * @devlink: ice adapter's devlink (whole dev devlink)
  * @ptp_gltsyn_time_lock: Spinlock protecting access to the GLTSYN_TIME
@@ -46,6 +79,7 @@ struct ice_port_list {
  * @cgu_synce_lock: Mutex serializing changes of the CGU registers R10 and R11,
  *                  which all PFs reach. Used on E825C devices.
  * @ps_lock: Mutex to serialize PHY port start/stop across adapter.
+ * @phc: PTP Hardware Clock fields
  * @ctrl_pf_lock: Protect control PF lifetime for sleepable users
  * @ctrl_pf: Control PF of the adapter
  * @rebuild_lock: serialize PFR recovery across PFs of the same adapter
@@ -67,6 +101,8 @@ struct ice_adapter {
 
 	/* For serializing PHY port start/stop sequences */
 	struct mutex ps_lock;
+
+	struct ice_phc phc;
 
 	struct rw_semaphore ctrl_pf_lock;
 	struct ice_pf __rcu *ctrl_pf;
