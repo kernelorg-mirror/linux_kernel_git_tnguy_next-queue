@@ -1612,6 +1612,9 @@ static int ice_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
 	u64 incval;
 	int err;
 
+	if (pf->ptp.state != ICE_PTP_READY)
+		return -EIO;
+
 	incval = adjust_by_scaled_ppm(ice_base_incval(pf), scaled_ppm);
 	err = ice_ptp_write_incval_locked(hw, incval);
 	if (err) {
@@ -2002,6 +2005,9 @@ static int ice_ptp_gpio_enable(struct ptp_clock_info *info,
 		struct ptp_perout_request *cached =
 			&pf->ptp.perout_rqs[rq->perout.index];
 
+		if (on && pf->ptp.state != ICE_PTP_READY)
+			return -EIO;
+
 		err = ice_ptp_cfg_perout(pf, &rq->perout, on);
 		if (!err) {
 			*cached = rq->perout;
@@ -2015,6 +2021,9 @@ static int ice_ptp_gpio_enable(struct ptp_clock_info *info,
 	{
 		struct ptp_extts_request *cached =
 			&pf->ptp.extts_rqs[rq->extts.index];
+
+		if (on && pf->ptp.state != ICE_PTP_READY)
+			return -EIO;
 
 		err = ice_ptp_cfg_extts(pf, &rq->extts, on);
 		if (!err)
@@ -2069,6 +2078,9 @@ ice_ptp_settime64(struct ptp_clock_info *info, const struct timespec64 *ts)
 	struct timespec64 ts64 = *ts;
 	struct ice_hw *hw = &pf->hw;
 	int err;
+
+	if (pf->ptp.state != ICE_PTP_READY)
+		return -EIO;
 
 	/* For Vernier mode on E82X, we need to recalibrate after new settime.
 	 * Start with marking timestamps as invalid.
@@ -2138,6 +2150,9 @@ static int ice_ptp_adjtime(struct ptp_clock_info *info, s64 delta)
 	struct ice_hw *hw = &pf->hw;
 	struct device *dev;
 	int err;
+
+	if (pf->ptp.state != ICE_PTP_READY)
+		return -EIO;
 
 	dev = ice_pf_to_dev(pf);
 
