@@ -1518,10 +1518,9 @@ ice_tx_map(struct ice_tx_ring *tx_ring, struct ice_tx_buf *first,
 
 	if (ice_is_txtime_cfg(tx_ring)) {
 		struct ice_tstamp_ring *tstamp_ring;
-		u32 tstamp_count, j;
 		struct ice_ts_desc *ts_desc;
-		struct timespec64 ts;
-		u32 tstamp;
+		u32 tstamp_count, j;
+		u64 tstamp;
 
 		smp_rmb();	/* order flag read before pointer read */
 		tstamp_ring = READ_ONCE(tx_ring->tstamp_ring);
@@ -1531,8 +1530,8 @@ ice_tx_map(struct ice_tx_ring *tx_ring, struct ice_tx_buf *first,
 		tstamp_count = tstamp_ring->count;
 		j = tstamp_ring->next_to_use;
 
-		ts = ktime_to_timespec64(first->skb->tstamp);
-		tstamp = ts.tv_nsec >> ICE_TXTIME_CTX_RESOLUTION_128NS;
+		tstamp = ktime_to_ns(first->skb->tstamp);
+		tstamp >>= ICE_TXTIME_CTX_RESOLUTION_128NS;
 
 		ts_desc = ICE_TS_DESC(tstamp_ring, j);
 		ts_desc->tx_desc_idx_tstamp = ice_build_tstamp_desc(i, tstamp);
