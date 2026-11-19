@@ -263,19 +263,27 @@ DEFINE_TX_TSTAMP_OP_EVENT(ice_tx_tstamp_complete);
 
 /* Trace event for Rx timestamp */
 TRACE_EVENT(ice_rx_hwtstamp,
-	    TP_PROTO(u64 cached_time, u32 ts_high, u64 ts_ns),
+	    TP_PROTO(int timecounter, u64 cycle_last, u64 nsec,
+		     u64 cached_time, u32 ts_high, u64 ts_ns),
 
-	    TP_ARGS(cached_time, ts_high, ts_ns),
+	    TP_ARGS(timecounter, cycle_last, nsec, cached_time, ts_high, ts_ns),
 
-	    TP_STRUCT__entry(__field(u64, cached_time)
+	    TP_STRUCT__entry(__field(int, timecounter)
+			     __field(u64, cycle_last)
+			     __field(u64, nsec)
+			     __field(u64, cached_time)
 			     __field(u32, ts_high)
 			     __field(u64, ts_ns)),
 
-	    TP_fast_assign(__entry->cached_time = cached_time;
+	    TP_fast_assign(__entry->timecounter = timecounter;
+			   __entry->cycle_last = cycle_last;
+			   __entry->nsec = nsec;
+			   __entry->cached_time = cached_time;
 			   __entry->ts_high = ts_high;
 			   __entry->ts_ns = ts_ns;),
 
-	    TP_printk("cached_time=%llu ts_high=%u ts_ns=%llu",
+	    TP_printk("timecounter=%d cycle_last=%llu nsec=%llu cached_time=%llu ts_high=%u ts_ns=%llu",
+		      __entry->timecounter, __entry->cycle_last, __entry->nsec,
 		      __entry->cached_time, __entry->ts_high, __entry->ts_ns)
 );
 

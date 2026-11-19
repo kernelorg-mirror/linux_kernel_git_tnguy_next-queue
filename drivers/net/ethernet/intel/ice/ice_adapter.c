@@ -15,6 +15,18 @@
 #define ICE_ADAPTER_INDEX_E825C	\
 	(ICE_DEV_ID_E825C_BACKPLANE | ICE_ADAPTER_FIXED_INDEX)
 
+static bool ice_adapter_use_timecounter(const struct ice_hw *hw)
+{
+	switch (hw->mac_type) {
+	case ICE_MAC_GENERIC_3K_E825:
+	case ICE_MAC_E830:
+		return true;
+	default:
+		/* Keep legacy approach for older devices */
+		return false;
+	}
+}
+
 static u64 ice_adapter_index(struct pci_dev *pdev)
 {
 	switch (pdev->device) {
@@ -39,6 +51,7 @@ static u64 ice_adapter_index(struct pci_dev *pdev)
 
 static int ice_adapter_init(void *priv, void *init_param)
 {
+	const struct ice_hw *hw = init_param;
 	struct ice_adapter *adapter = priv;
 	struct devlink *devlink;
 
@@ -58,8 +71,18 @@ static int ice_adapter_init(void *priv, void *init_param)
 
 	mutex_init(&adapter->ps_lock);
 
+	adapter->phc.cc.mask = CYCLECOUNTER_MASK(32);
+	adapter->phc.cc.mult = 1;
+	adapter->phc.cc.shift = 0;
+	adapter->phc.cc.read = ice_ptp_read_cycles;
+
+	timecounter_init(&adapter->phc.tc[0], &adapter->phc.cc, 0);
+	timecounter_init(&adapter->phc.tc[1], &adapter->phc.cc, 0);
+
 	seqcount_latch_init(&adapter->phc.seq);
 	mutex_init(&adapter->phc.lock);
+
+	adapter->phc.use_timecounter = ice_adapter_use_timecounter(hw);
 
 	return init_srcu_struct(&adapter->ports.srcu);
 }
@@ -100,6 +123,7 @@ static const struct devlink_ops ice_adapter_devlink_ops = {
  */
 struct ice_adapter *ice_adapter_get(struct pci_dev *pdev)
 {
+	struct ice_pf *pf = pci_get_drvdata(pdev);
 	struct ice_adapter *adapter;
 	struct devlink *devlink;
 	char devlink_id[32];
@@ -108,7 +132,7 @@ struct ice_adapter *ice_adapter_get(struct pci_dev *pdev)
 	index = ice_adapter_index(pdev);
 	snprintf(devlink_id, sizeof(devlink_id), "ice:%llx", index);
 	devlink = devlink_shd_get(devlink_id, &ice_adapter_devlink_ops,
-				  sizeof(*adapter), NULL, pdev->dev.driver);
+				  sizeof(*adapter), &pf->hw, pdev->dev.driver);
 	if (IS_ERR(devlink))
 		return ERR_CAST(devlink);
 

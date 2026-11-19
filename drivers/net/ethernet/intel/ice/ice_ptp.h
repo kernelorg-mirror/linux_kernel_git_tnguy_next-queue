@@ -326,6 +326,8 @@ irqreturn_t ice_ptp_ts_irq(struct ice_pf *pf);
 bool ice_ptp_tx_tstamps_pending(struct ice_pf *pf, bool in_irq);
 int ice_ptp_read_src_clk_reg(struct ice_pf *pf,
 			     struct ptp_system_timestamp *sts, u64 *time);
+u64 ice_ptp_read_cycles(struct cyclecounter *cc);
+s64 ice_phc_get_phase(struct ice_phc *phc);
 
 u64 ice_ptp_get_rx_hwts(const union ice_32b_rx_flex_desc *rx_desc,
 			const struct ice_pkt_ctx *pkt_ctx);
@@ -382,6 +384,16 @@ static inline int ice_ptp_read_src_clk_reg(struct ice_pf *pf,
 					   u64 *time)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline u64 ice_ptp_read_cycles(struct cyclecounter *cc)
+{
+	return 0;
+}
+
+static inline s64 ice_phc_get_phase(struct ice_phc *phc)
+{
+	return 0;
 }
 
 static inline u64
