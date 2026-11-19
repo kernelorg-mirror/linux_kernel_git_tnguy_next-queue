@@ -273,6 +273,128 @@ int ice_ptp_read_src_clk_reg(struct ice_pf *pf,
 }
 
 /**
+ * ice_ptp_read_cycles - cyclecounter read() callback function
+ * @cc: the hardware cycle counter structure
+ *
+ * Read the PHC time via ice_ptp_read_src_clk_reg() and report it for use
+ * within timecounter_read() and timecounter_init().
+ *
+ * Although the cycle counter is masked to 32-bits for timestamp extension,
+ * this still reports the full 64-bit time to enable determining the phase
+ * difference between the PHC hardware value and the timecounter properly.
+ *
+ * Return: The current PHC timer value from the hardware on success.
+ *         Since failure cannot be meaningfully reported, return the previous
+ *         cycle_last value when unable to access the device.
+ */
+u64 ice_ptp_read_cycles(struct cyclecounter *cc)
+{
+	struct ice_adapter *adapter;
+	struct ice_phc *phc;
+	struct ice_pf *pf;
+	u64 time;
+	int err;
+
+	phc = container_of(cc, struct ice_phc, cc);
+	adapter = container_of(phc, struct ice_adapter, phc);
+
+	scoped_guard(rcu) {
+		pf = rcu_dereference(adapter->ctrl_pf);
+		if (!pf)
+			return phc->tc[0].cycle_last;
+
+		err = ice_ptp_read_src_clk_reg(pf, NULL, &time);
+		if (err)
+			return phc->tc[0].cycle_last;
+
+		/* This is called only as part of timecounter_read or
+		 * timecounter_init() which are always under
+		 * a write_seqcount_latch_begin() updating the first copy of
+		 * the timecounter.
+		 */
+		phc->update_time[0] = ktime_get_boottime();
+		return time;
+	}
+}
+
+/**
+ * ice_phc_get_phase - Determine timecounter phase offset
+ * @phc: pointer to the PHC structure
+ *
+ * Compute the phase difference between the timecounter and the current
+ * hardware clock value. Note that the cycle counter reports the full
+ * 64-bits of nanoseconds, so this computes the phase difference between the
+ * timecounter and the full MAC timer which keeps counting after the lower
+ * 32-bits of GLTSYN_TIME_L overflow.
+ *
+ * Return: phase difference between the timecounter and the MAC timer.
+ */
+s64 ice_phc_get_phase(struct ice_phc *phc)
+{
+	unsigned int seq, idx;
+	s64 phase;
+
+	do {
+		seq = read_seqcount_latch(&phc->seq);
+		idx = seq & 0x1;
+
+		phase = phc->tc[idx].nsec - phc->tc[idx].cycle_last;
+	} while (read_seqcount_latch_retry(&phc->seq, seq));
+
+	return phase;
+}
+
+/**
+ * ice_phc_init - Initialize PHC timecounter to new start value
+ * @phc: pointer to the PHC structure
+ * @init_tstamp: New initial value for the timecounter
+ *
+ * Initialize the PHC timecounter to a new offset. The latched sequence
+ * counter is used to ensure readers get a consistent view of the timecounter
+ * phase. We always pass the same cyclecounter structure, so the mask, frac,
+ * and cc fields always remain the same, and only the cycle_last and nsec
+ * fields must be propagated to the secondary structure.
+ */
+static void ice_phc_init(struct ice_phc *phc, u64 init_tstamp)
+{
+	lockdep_assert_held(&phc->lock);
+
+	write_seqcount_latch_begin(&phc->seq);
+	timecounter_init(&phc->tc[0], &phc->cc, init_tstamp);
+	write_seqcount_latch(&phc->seq);
+	/* Update the secondary copy */
+	phc->tc[1].cycle_last = phc->tc[0].cycle_last;
+	phc->tc[1].nsec = phc->tc[0].nsec;
+	phc->update_time[1] = phc->update_time[0];
+	write_seqcount_latch_end(&phc->seq);
+}
+
+/**
+ * ice_phc_adjtime - Adjust PHC timecounter by delta
+ * @phc: pointer to the PHC structure
+ * @delta: the delta to adjust by
+ *
+ * Adjust the PHC timecounter offset by the provided delta. The latched
+ * sequence counter is used to ensure readers get a consistent view of the
+ * timecounter phase. The frac, mask, and cc fields always remain their
+ * initial values, so only cycle_last and nsec need to be propagated to the
+ * secondary timecounter structure.
+ */
+static void ice_phc_adjtime(struct ice_phc *phc, s64 delta)
+{
+	lockdep_assert_held(&phc->lock);
+
+	write_seqcount_latch_begin(&phc->seq);
+	timecounter_adjtime(&phc->tc[0], delta);
+	write_seqcount_latch(&phc->seq);
+	/* Update the secondary copy */
+	phc->tc[1].cycle_last = phc->tc[0].cycle_last;
+	phc->tc[1].nsec = phc->tc[0].nsec;
+	phc->update_time[1] = phc->update_time[0];
+	write_seqcount_latch_end(&phc->seq);
+}
+
+/**
  * ice_ptp_extend_32b_ts - Convert a 32b nanoseconds timestamp to 64b
  * @phc: PTP Hardware Clock structure
  * @in_tstamp: Ingress/egress 32b nanoseconds timestamp value
@@ -282,6 +404,12 @@ int ice_ptp_read_src_clk_reg(struct ice_pf *pf,
  * nanoseconds, as opposed to the 64bit timestamps that the stack expects.
  * Note that the captured timestamp values may be 40 bits, but the lower
  * 8 bits are sub-nanoseconds and generally discarded.
+ *
+ * For devices which use the timecounter, use timecounter_cyc2time to
+ * convert the 32-bit hardware timestamp in cycles to the full 64-bit
+ * nanoseconds.
+ *
+ * For other devices not using the timecounter:
  *
  * Extend the 32bit nanosecond timestamp using the following algorithm and
  * assumptions:
@@ -316,7 +444,7 @@ int ice_ptp_read_src_clk_reg(struct ice_pf *pf,
 static u64 ice_ptp_extend_32b_ts(struct ice_phc *phc,
 				 u32 in_tstamp, bool trace_rx)
 {
-	u64 ns, cached_phc_time;
+	u64 ns, cached_phc_time, cycle_last, nsec;
 	u32 delta, phc_time_lo;
 	unsigned int seq, idx;
 	ktime_t update_time;
@@ -328,6 +456,12 @@ static u64 ice_ptp_extend_32b_ts(struct ice_phc *phc,
 
 		update_time = phc->update_time[idx];
 		cached_phc_time = phc->cached_time[idx];
+
+		if (phc->use_timecounter) {
+			cycle_last = phc->tc[idx].cycle_last;
+			nsec = phc->tc[idx].nsec;
+			ns = timecounter_cyc2time(&phc->tc[idx], in_tstamp);
+		}
 	} while (read_seqcount_latch_retry(&phc->seq, seq));
 
 	/* Discard the timestamp if update_time isn't initialized */
@@ -337,6 +471,14 @@ static u64 ice_ptp_extend_32b_ts(struct ice_phc *phc,
 	/* Discard the hardware timestamp if update_time is stale */
 	if (ktime_ms_delta(ktime_get_coarse_boottime(), update_time) > 2000)
 		return 0;
+
+	/* The timestamp was already converted for timecounter mode */
+	if (phc->use_timecounter) {
+		if (trace_rx)
+			ice_trace(rx_hwtstamp, phc->use_timecounter,
+				  cycle_last, nsec, 0, in_tstamp, ns);
+		return ns;
+	}
 
 	phc_time_lo = (u32)cached_phc_time;
 
@@ -359,7 +501,8 @@ static u64 ice_ptp_extend_32b_ts(struct ice_phc *phc,
 	}
 
 	if (trace_rx)
-		ice_trace(rx_hwtstamp, cached_phc_time, in_tstamp, ns);
+		ice_trace(rx_hwtstamp, phc->use_timecounter,
+			  0, 0, cached_phc_time, in_tstamp, ns);
 
 	return ns;
 }
@@ -1035,7 +1178,8 @@ static int ice_ptp_init_tx(struct ice_pf *pf, struct ice_ptp_tx *tx, u8 port)
  * ice_ptp_update_cached_phctime - Update the cached PHC time value
  * @pf: Board specific private structure
  *
- * Update the cached PHC time used for timestamp extension.
+ * For devices that use a timecounter structure, update the timecounter.
+ * Otherwise, update the cached PHC time used for timestamp extension.
  *
  * This function must be called periodically by the clock owner to ensure that
  * the timecounter or cached value is never more than 2 seconds old.
@@ -1045,9 +1189,7 @@ static void ice_ptp_update_cached_phctime(struct ice_pf *pf)
 	struct ice_phc *phc = &pf->adapter->phc;
 	struct device *dev = ice_pf_to_dev(pf);
 	ktime_t now;
-	u64 systime;
 	s64 delta;
-	int err;
 
 	mutex_lock(&phc->lock);
 
@@ -1061,22 +1203,33 @@ static void ice_ptp_update_cached_phctime(struct ice_pf *pf)
 
 	write_seqcount_latch_begin(&phc->seq);
 
-	/* Read the current PHC time */
-	err = ice_ptp_read_src_clk_reg(pf, NULL, &systime);
-	if (err) {
-		/* The source clock is gone, so the cache can no longer be
-		 * refreshed. Publish zero instead of leaving the last good
-		 * value behind.
-		 */
-		systime = 0;
-		now = ns_to_ktime(0);
+	if (phc->use_timecounter) {
+		(void)timecounter_read(&phc->tc[0]);
+	} else {
+		u64 systime;
+		int err;
+
+		err = ice_ptp_read_src_clk_reg(pf, NULL, &systime);
+		if (err) {
+			/* The source clock is gone, so the cache can no
+			 * longer be refreshed. Publish zero instead of
+			 * leaving the last good value behind.
+			 */
+			systime = 0;
+			now = ns_to_ktime(0);
+		}
+		phc->cached_time[0] = systime;
+		phc->update_time[0] = now;
 	}
 
-	phc->cached_time[0] = systime;
-	phc->update_time[0] = now;
 	write_seqcount_latch(&phc->seq);
-	phc->cached_time[1] = systime;
-	phc->update_time[1] = now;
+	if (phc->use_timecounter) {
+		phc->tc[1].cycle_last = phc->tc[0].cycle_last;
+		phc->tc[1].nsec = phc->tc[0].nsec;
+	} else {
+		phc->cached_time[1] = phc->cached_time[0];
+	}
+	phc->update_time[1] = phc->update_time[0];
 	write_seqcount_latch_end(&phc->seq);
 
 	mutex_unlock(&phc->lock);
@@ -1621,6 +1774,7 @@ static int ice_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
  */
 void ice_ptp_extts_event(struct ice_pf *pf)
 {
+	struct ice_phc *phc = &pf->adapter->phc;
 	struct ptp_clock_event event;
 	struct ice_hw *hw = &pf->hw;
 	u8 chan, tmr_idx;
@@ -1646,6 +1800,9 @@ void ice_ptp_extts_event(struct ice_pf *pf)
 		lo = rd32(hw, GLTSYN_EVNT_L(chan, tmr_idx));
 		hi = rd32(hw, GLTSYN_EVNT_H(chan, tmr_idx));
 		event.timestamp = (u64)hi << 32 | lo;
+
+		if (phc->use_timecounter)
+			event.timestamp += ice_phc_get_phase(phc);
 
 		/* Add delay compensation */
 		pin_desc_idx = ice_ptp_find_pin_idx(pf, PTP_PF_EXTTS, chan);
@@ -1847,8 +2004,9 @@ static int ice_ptp_write_perout(struct ice_hw *hw, unsigned int chan,
 static int ice_ptp_cfg_perout(struct ice_pf *pf, struct ptp_perout_request *rq,
 			      int on)
 {
+	u64 clk, period, start, phase, cycles, tc_phase;
+	struct ice_phc *phc = &pf->adapter->phc;
 	unsigned int gpio_pin, prop_delay_ns;
-	u64 clk, period, start, phase;
 	struct ice_hw *hw = &pf->hw;
 	int pin_desc_idx;
 	int err;
@@ -1893,12 +2051,22 @@ static int ice_ptp_cfg_perout(struct ice_pf *pf, struct ptp_perout_request *rq,
 	err = ice_ptp_read_src_clk_reg(pf, NULL, &clk);
 	if (err)
 		return err;
+	if (phc->use_timecounter) {
+		cycles = clk;
+		tc_phase = ice_phc_get_phase(phc);
+		clk = cycles + tc_phase;
+	}
 	clk += NSEC_PER_MSEC * 500;
+
 	if (rq->flags & PTP_PEROUT_PHASE || start <= clk - prop_delay_ns)
 		start = div64_u64(clk + period - 1, period) * period + phase;
 
 	/* Compensate for propagation delay from the generator to the pin. */
 	start -= prop_delay_ns;
+
+	/* Compensate for timecounter phase offset, if necessary */
+	if (phc->use_timecounter)
+		start -= tc_phase;
 
 	return ice_ptp_write_perout(hw, rq->index, gpio_pin, start, period);
 }
@@ -1997,6 +2165,8 @@ static int ice_ptp_gpio_enable(struct ptp_clock_info *info,
 		if (on && pf->ptp.state != ICE_PTP_READY)
 			return -EIO;
 
+		/* Serialize against concurrent timecounter updates */
+		mutex_lock(&pf->adapter->phc.lock);
 		err = ice_ptp_cfg_perout(pf, &rq->perout, on);
 		if (!err) {
 			*cached = rq->perout;
@@ -2004,6 +2174,7 @@ static int ice_ptp_gpio_enable(struct ptp_clock_info *info,
 			cached->period.sec = 0;
 			cached->period.nsec = 0;
 		}
+		mutex_unlock(&pf->adapter->phc.lock);
 		return err;
 	}
 	case PTP_CLK_REQ_EXTTS:
@@ -2033,8 +2204,7 @@ static int ice_ptp_gpio_enable(struct ptp_clock_info *info,
  * @sts: Optional parameter for holding a pair of system timestamps from
  *       the system clock. Will be ignored if NULL is given.
  *
- * Read the device clock and return the correct value on ns, after converting it
- * into a timespec struct.
+ * Read the device time from the PHC and return it as a timespec.
  */
 static int
 ice_ptp_gettimex64(struct ptp_clock_info *info, struct timespec64 *ts,
@@ -2047,6 +2217,9 @@ ice_ptp_gettimex64(struct ptp_clock_info *info, struct timespec64 *ts,
 	err = ice_ptp_read_src_clk_reg(pf, sts, &time_ns);
 	if (err)
 		return err;
+
+	if (pf->adapter->phc.use_timecounter)
+		time_ns += ice_phc_get_phase(&pf->adapter->phc);
 
 	*ts = ns_to_timespec64(time_ns);
 	return 0;
@@ -2105,6 +2278,43 @@ exit:
 		dev_err(ice_pf_to_dev(pf), "PTP failed to set time %d\n", err);
 		return err;
 	}
+
+	return 0;
+}
+
+/**
+ * ice_ptp_settime64_tc - Initialize the PHC timecounter to requested time
+ * @info: the driver's PTP info structure
+ * @ts: timespec64 structure that holds the new time value.
+ *
+ * Reset the PHC timecounter to the provided user input value.
+ *
+ * Return: 0 on success, -EIO if PTP state is not ready.
+ */
+static int ice_ptp_settime64_tc(struct ptp_clock_info *info,
+				const struct timespec64 *ts)
+{
+	struct ice_pf *pf = ptp_info_to_pf(info);
+	struct ice_phc *phc = &pf->adapter->phc;
+	u64 ns;
+
+	if (pf->ptp.state != ICE_PTP_READY)
+		return -EIO;
+
+	ns = timespec64_to_ns(ts);
+
+	mutex_lock(&phc->lock);
+
+	ice_ptp_disable_all_perout(pf);
+
+	ice_phc_init(phc, ns);
+
+	ice_ptp_mark_all_tx_tracker_stale(pf);
+
+	/* Reenable periodic outputs */
+	ice_ptp_enable_all_perout(pf);
+
+	mutex_unlock(&phc->lock);
 
 	return 0;
 }
@@ -2175,6 +2385,37 @@ static int ice_ptp_adjtime(struct ptp_clock_info *info, s64 delta)
 	}
 
 	ice_ptp_reset_cached_phctime(pf);
+
+	return 0;
+}
+
+/**
+ * ice_ptp_adjtime_tc - Adjust the timecounter offset by the indicated delta
+ * @info: the driver's PTP info structure
+ * @delta: Offset in nanoseconds to adjust the time by
+ *
+ * Return: 0 on success, -EIO if PTP state is not ready.
+ */
+static int ice_ptp_adjtime_tc(struct ptp_clock_info *info, s64 delta)
+{
+	struct ice_pf *pf = ptp_info_to_pf(info);
+	struct ice_phc *phc = &pf->adapter->phc;
+
+	if (pf->ptp.state != ICE_PTP_READY)
+		return -EIO;
+
+	mutex_lock(&phc->lock);
+
+	ice_ptp_disable_all_perout(pf);
+
+	ice_phc_adjtime(phc, delta);
+
+	ice_ptp_mark_all_tx_tracker_stale(pf);
+
+	/* Reenable periodic outputs */
+	ice_ptp_enable_all_perout(pf);
+
+	mutex_unlock(&phc->lock);
 
 	return 0;
 }
@@ -2314,6 +2555,11 @@ static int ice_capture_crosststamp(ktime_t *device,
 	ts_lo = rd32(hw, cfg->dev_time_l[tmr_idx]);
 	ts_hi = rd32(hw, cfg->dev_time_h[tmr_idx]);
 	ts = ((u64)ts_hi << 32) | ts_lo;
+
+	/* Account for timecounter phase offset if necessary */
+	if (pf->adapter->phc.use_timecounter)
+		ts += ice_phc_get_phase(&pf->adapter->phc);
+
 	*device = ns_to_ktime(ts);
 
 err_timeout:
@@ -2701,14 +2947,20 @@ static void ice_ptp_set_caps(struct ice_pf *pf)
 		 dev_driver_string(dev), dev_name(dev));
 	info->owner = THIS_MODULE;
 	info->max_adj = 100000000;
-	info->adjtime = ice_ptp_adjtime;
 	info->adjfine = ice_ptp_adjfine;
 	info->gettimex64 = ice_ptp_gettimex64;
-	info->settime64 = ice_ptp_settime64;
 	info->n_per_out = GLTSYN_TGT_H_IDX_MAX;
 	info->n_ext_ts = GLTSYN_EVNT_H_IDX_MAX;
 	info->enable = ice_ptp_gpio_enable;
 	info->verify = ice_verify_pin;
+
+	if (pf->adapter->phc.use_timecounter) {
+		info->adjtime = ice_ptp_adjtime_tc;
+		info->settime64 = ice_ptp_settime64_tc;
+	} else {
+		info->adjtime = ice_ptp_adjtime;
+		info->settime64 = ice_ptp_settime64;
+	}
 
 	info->supported_extts_flags = PTP_RISING_EDGE |
 				      PTP_FALLING_EDGE |
@@ -3198,8 +3450,8 @@ static int ice_ptp_rebuild_owner(struct ice_pf *pf)
 	struct ice_phc *phc = &pf->adapter->phc;
 	struct ice_ptp *ptp = &pf->ptp;
 	struct ice_hw *hw = &pf->hw;
-	struct timespec64 ts;
 	int err;
+	u64 ns;
 
 	err = ice_ptp_init_phc(hw);
 	if (err)
@@ -3221,7 +3473,7 @@ static int ice_ptp_rebuild_owner(struct ice_pf *pf)
 	/* Write the increment time value to PHY and LAN */
 	err = ice_ptp_write_incval(hw, ice_base_incval(pf));
 	if (err)
-		goto err_unlock;
+		goto err_unlock_hw;
 
 	/* Write the initial Time value to PHY and LAN using the last known
 	 * cached PHC time and the monotonic time difference since that
@@ -3231,14 +3483,24 @@ static int ice_ptp_rebuild_owner(struct ice_pf *pf)
 	if (phc->update_time[0]) {
 		s64 delta = ktime_sub(ktime_get_boottime(), phc->update_time[0]);
 
-		ts = ns_to_timespec64(phc->cached_time[0] + delta);
+		if (phc->use_timecounter)
+			ns = phc->tc[0].nsec + delta;
+		else
+			ns = phc->cached_time[0] + delta;
 	} else {
-		ts = ktime_to_timespec64(ktime_get_real());
+		ns = ktime_get_real_ns();
+	}
+
+	if (phc->use_timecounter) {
+		ice_phc_init(phc, ns);
+	} else {
+		struct timespec64 ts = ns_to_timespec64(ns);
+
+		err = ice_ptp_write_init(pf, &ts);
+		if (err)
+			goto err_unlock_phc;
 	}
 	mutex_unlock(&phc->lock);
-	err = ice_ptp_write_init(pf, &ts);
-	if (err)
-		goto err_unlock;
 
 	/* Release the global hardware lock */
 	ice_ptp_unlock(hw);
@@ -3261,7 +3523,9 @@ static int ice_ptp_rebuild_owner(struct ice_pf *pf)
 
 	return 0;
 
-err_unlock:
+err_unlock_phc:
+	mutex_unlock(&phc->lock);
+err_unlock_hw:
 	ice_ptp_unlock(hw);
 	return err;
 }
@@ -3427,8 +3691,8 @@ int ice_ptp_clock_index(struct ice_pf *pf)
  */
 static int ice_ptp_init_owner(struct ice_pf *pf)
 {
+	struct ice_phc *phc = &pf->adapter->phc;
 	struct ice_hw *hw = &pf->hw;
-	struct timespec64 ts;
 	int err;
 
 	err = ice_ptp_init_phc(hw);
@@ -3456,11 +3720,19 @@ static int ice_ptp_init_owner(struct ice_pf *pf)
 	if (err)
 		goto err_unlock;
 
-	ts = ktime_to_timespec64(ktime_get_real());
-	/* Write the initial Time value to PHY and LAN */
-	err = ice_ptp_write_init(pf, &ts);
-	if (err)
-		goto err_unlock;
+	if (phc->use_timecounter) {
+		mutex_lock(&phc->lock);
+		ice_phc_init(phc, ktime_get_real_ns());
+		mutex_unlock(&phc->lock);
+	} else {
+		struct timespec64 ts;
+
+		/* Write the initial Time value to PHY and LAN */
+		ktime_get_real_ts64(&ts);
+		err = ice_ptp_write_init(pf, &ts);
+		if (err)
+			goto err_unlock;
+	}
 
 	/* Release the global hardware lock */
 	ice_ptp_unlock(hw);

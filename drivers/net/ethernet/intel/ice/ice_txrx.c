@@ -395,6 +395,7 @@ static bool ice_clean_tx_irq(struct ice_tx_ring *tx_ring, int napi_budget)
  */
 static int ice_alloc_tstamp_ring(struct ice_tx_ring *tx_ring)
 {
+	struct ice_pf *pf = tx_ring->vsi->back;
 	struct ice_tstamp_ring *tstamp_ring;
 
 	/* allocate with kzalloc(), free with kfree_rcu() */
@@ -403,6 +404,7 @@ static int ice_alloc_tstamp_ring(struct ice_tx_ring *tx_ring)
 		return -ENOMEM;
 
 	tstamp_ring->tx_ring = tx_ring;
+	tstamp_ring->phc = &pf->adapter->phc;
 	tx_ring->tstamp_ring = tstamp_ring;
 	tstamp_ring->desc = NULL;
 	tstamp_ring->count = ice_calc_ts_ring_count(tx_ring);
@@ -1519,6 +1521,7 @@ ice_tx_map(struct ice_tx_ring *tx_ring, struct ice_tx_buf *first,
 	if (ice_is_txtime_cfg(tx_ring)) {
 		struct ice_tstamp_ring *tstamp_ring;
 		struct ice_ts_desc *ts_desc;
+		struct ice_phc *phc;
 		u32 tstamp_count, j;
 		u64 tstamp;
 
@@ -1527,10 +1530,14 @@ ice_tx_map(struct ice_tx_ring *tx_ring, struct ice_tx_buf *first,
 		if (unlikely(!tstamp_ring))
 			goto ring_kick;
 
+		phc = tstamp_ring->phc;
+
 		tstamp_count = tstamp_ring->count;
 		j = tstamp_ring->next_to_use;
 
 		tstamp = ktime_to_ns(first->skb->tstamp);
+		if (phc->use_timecounter)
+			tstamp -= ice_phc_get_phase(phc);
 		tstamp >>= ICE_TXTIME_CTX_RESOLUTION_128NS;
 
 		ts_desc = ICE_TS_DESC(tstamp_ring, j);

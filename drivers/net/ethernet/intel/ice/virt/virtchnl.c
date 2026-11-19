@@ -326,7 +326,12 @@ static int ice_vc_get_vf_res_msg(struct ice_vf *vf, u8 *msg)
 	if (vf->driver_caps & VIRTCHNL_VF_OFFLOAD_QOS)
 		vfres->vf_cap_flags |= VIRTCHNL_VF_OFFLOAD_QOS;
 
-	if (vf->driver_caps & VIRTCHNL_VF_CAP_PTP)
+	/* Do not enable VF PTP capability on devices which use a timecounter.
+	 * Proper support for these devices requires extensions to the
+	 * virtchnl interface that have not yet been developed.
+	 */
+	if (vf->driver_caps & VIRTCHNL_VF_CAP_PTP &&
+	    !vf->pf->adapter->phc.use_timecounter)
 		vfres->vf_cap_flags |= VIRTCHNL_VF_CAP_PTP;
 
 	vfres->num_vsis = 1;

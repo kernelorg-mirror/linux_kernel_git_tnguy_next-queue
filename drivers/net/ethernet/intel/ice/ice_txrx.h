@@ -266,6 +266,7 @@ enum ice_dynamic_itr {
 /* descriptor ring, associated with a VSI */
 struct ice_tstamp_ring {
 	struct ice_tx_ring *tx_ring;	/* Backreference to associated Tx ring */
+	struct ice_phc *phc;
 	dma_addr_t dma;			/* physical address of ring */
 	struct rcu_head rcu;            /* to avoid race on free */
 	u8 __iomem *tail;

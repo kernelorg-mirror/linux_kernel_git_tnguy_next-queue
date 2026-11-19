@@ -10,6 +10,7 @@
 #include <linux/seqlock.h>
 #include <linux/srcu.h>
 #include <linux/spinlock_types.h>
+#include <linux/timecounter.h>
 
 #include <net/devlink.h>
 
@@ -40,15 +41,26 @@ struct ice_port_list {
  * struct ice_phc - PTP Hardware Clock fields
  *
  * Structure used for handling the timestamp extension logic for this device.
+ * Devices will either use the legacy timestamp extension logic or
+ * a timecounter, not both.
+ *
+ * For simplicity, the timecounter fields are initialized as part of creating
+ * the ice_adapter regardless of whether the device will actually use them.
  *
  * Legacy timestamp extension fields:
  * @cached_time: Cached copy of the PHC time for timestamp extension
+ *
+ * struct timecounter fields:
+ * @tc: timecounter representing the current time. Accessed via seq to allow
+ *      lockless readers during updates.
+ * @cc: cyclecounter underlying the timecounter
  *
  * General fields:
  * @update_time: Monotonic time when PHC was laste updated
  * @seq: seqcount_latch_t used to protect readers, directing them to the
  *       secondary copy during an update.
  * @lock: For protecting updates to the PHC fields.
+ * @use_timecounter: if true, the device uses the timecounter
  *
  * Readers are lockless and rely on the latched sequence counter for
  * a consistent view of the most recent update, even if they interrupt
@@ -61,11 +73,16 @@ struct ice_phc {
 	/* Legacy timestamp extension fields */
 	u64 cached_time[2];
 
+	/* struct timecounter fields */
+	struct timecounter tc[2];
+	struct cyclecounter cc;
+
 	/* General fields */
 	ktime_t update_time[2];
 	seqcount_latch_t seq;
-	/* Serialize updates to cached_time */
+	/* Serialize updates to cached_time or the timecounter */
 	struct mutex lock;
+	bool use_timecounter;
 };
 
 /**
